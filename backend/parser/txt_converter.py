@@ -12,10 +12,48 @@ from typing import List, Set
 
 logger = logging.getLogger(__name__)
 
-# Расширения которые мы обрабатываем
-CODE_EXTENSIONS = {'.cpp', '.h', '.hpp', '.cc', '.c', '.cxx', '.hxx', '.inl'}
-DOC_EXTENSIONS = {'.md', '.markdown', '.txt', '.rst'}
-ALL_VALID = CODE_EXTENSIONS | DOC_EXTENSIONS
+# C/C++ код — парсится через Tree-sitter (жёсткие связи AST)
+CPP_CODE_EXTENSIONS = {'.cpp', '.h', '.hpp', '.cc', '.c', '.cxx', '.hxx', '.inl'}
+
+# Код на других языках — парсится как DOCUMENT (пока без AST)
+OTHER_CODE_EXTENSIONS = {
+    '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.go', '.rs', '.rb',
+    '.cs', '.swift', '.kt', '.scala', '.lua', '.r', '.m', '.mm',
+    '.php', '.pl', '.pm', '.sh', '.bash', '.zsh', '.bat', '.ps1', '.cmd',
+    '.sql', '.html', '.htm', '.css', '.scss', '.sass', '.less',
+    '.xml', '.xsl', '.xslt', '.svg',  # SVG как код, не как картинка
+}
+
+# Структурированные данные и конфиги
+DATA_EXTENSIONS = {
+    '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
+    '.env', '.properties', '.editorconfig',
+    '.csv', '.tsv',
+}
+
+# Документация
+DOC_EXTENSIONS = {
+    '.md', '.markdown', '.txt', '.rst', '.adoc', '.asciidoc',
+    '.tex', '.latex', '.org',
+}
+
+# Логи и прочий текст
+LOG_EXTENSIONS = {'.log'}
+
+# Файлы без расширения которые часто текстовые
+KNOWN_TEXTFILES = {
+    'Makefile', 'Dockerfile', 'Vagrantfile', 'Jenkinsfile', 'Procfile',
+    'README', 'LICENSE', 'CHANGELOG', 'CONTRIBUTING', 'AUTHORS',
+    'CMakeLists.txt', '.clang-format', '.clang-tidy',
+    'requirements.txt', 'Pipfile', 'Gemfile', 'Cargo.toml',
+    'package.json', 'tsconfig.json', 'docker-compose.yml',
+}
+
+# Все текстовые расширения (объединение)
+ALL_TEXT_EXTENSIONS = (
+    CPP_CODE_EXTENSIONS | OTHER_CODE_EXTENSIONS |
+    DATA_EXTENSIONS | DOC_EXTENSIONS | LOG_EXTENSIONS
+)
 
 # Мусорные паттерны — пропускаем целиком
 SKIP_DIRS = {
@@ -137,25 +175,29 @@ def txt_to_markdown(filepath: str) -> str:
 
 def scan_and_filter(root_dir: str) -> dict:
     """
-    Сканирование директории с фильтрацией мусора.
+    Сканирование директории с умной фильтрацией.
+
+    Принцип: всё что текстовое — принимаем, бинарное — отсекаем.
+    Даже неизвестные расширения проверяем на текстовость.
 
     Returns:
         {
-            "code_files": [...],
-            "doc_files": [...],
-            "txt_files": [...],  # будут конвертированы в .md
+            "cpp_files": [...],       # C++ → Tree-sitter AST
+            "doc_files": [...],       # .md, .rst и т.д. → DOCUMENT
+            "txt_files": [...],       # .txt → конвертируем в .md
+            "other_text": [...],      # .py, .json, .yaml, .log и т.д. → DOCUMENT
             "skipped": [...],
-            "stats": {"total_scanned": N, "accepted": N, "filtered": N}
+            "stats": {total_scanned, accepted, filtered, by_category}
         }
     """
-    code_files = []
+    cpp_files = []
     doc_files = []
     txt_files = []
+    other_text = []
     skipped = []
     total = 0
 
     for root, dirs, files in os.walk(root_dir):
-        # Фильтруем мусорные директории
         dirs[:] = [d for d in dirs if not should_skip_dir(d)]
 
         for filename in files:
@@ -169,28 +211,50 @@ def scan_and_filter(root_dir: str) -> dict:
             _, ext = os.path.splitext(filename)
             ext = ext.lower()
 
+            # Бинарные — сразу отсекаем
+            if ext in BINARY_EXTENSIONS:
+                skipped.append(filepath)
+                continue
+
+            # Проверяем что файл реально текстовый и не слишком большой
             if not is_valid_text_file(filepath):
                 skipped.append(filepath)
                 continue
 
-            if ext in CODE_EXTENSIONS:
-                code_files.append(filepath)
+            # Классификация
+            if ext in CPP_CODE_EXTENSIONS:
+                cpp_files.append(filepath)
             elif ext == '.txt':
                 txt_files.append(filepath)
             elif ext in DOC_EXTENSIONS:
                 doc_files.append(filepath)
-            # Остальные расширения пропускаем
+            elif ext in OTHER_CODE_EXTENSIONS | DATA_EXTENSIONS | LOG_EXTENSIONS:
+                other_text.append(filepath)
+            elif filename in KNOWN_TEXTFILES:
+                other_text.append(filepath)
+            elif ext == '' or ext not in BINARY_EXTENSIONS:
+                # Неизвестное расширение — но прошло проверку is_valid_text_file
+                # Значит это текст → принимаем как документ
+                other_text.append(filepath)
 
-    accepted = len(code_files) + len(doc_files) + len(txt_files)
+    accepted = len(cpp_files) + len(doc_files) + len(txt_files) + len(other_text)
     return {
-        "code_files": code_files,
+        "cpp_files": cpp_files,
+        "code_files": cpp_files,  # backward compat
         "doc_files": doc_files,
         "txt_files": txt_files,
+        "other_text": other_text,
         "skipped": skipped,
         "stats": {
             "total_scanned": total,
             "accepted": accepted,
             "filtered": len(skipped),
+            "by_category": {
+                "cpp": len(cpp_files),
+                "docs": len(doc_files),
+                "txt": len(txt_files),
+                "other_text": len(other_text),
+            }
         }
     }
 

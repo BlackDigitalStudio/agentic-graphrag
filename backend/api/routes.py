@@ -495,9 +495,10 @@ async def upload_project(file: UploadFile = File(...)):
         "project_name": project_name,
         "project_dir": project_dir,
         "scan": scan["stats"],
-        "code_files": len(scan["code_files"]),
+        "cpp_files": len(scan["cpp_files"]),
         "doc_files": len(scan["doc_files"]),
         "txt_files": len(scan["txt_files"]),
+        "other_text": len(scan.get("other_text", [])),
     }
 
 
@@ -534,10 +535,7 @@ async def auto_pipeline(request: PipelineRequest):
     steps.append({
         "step": "scan",
         "status": "done",
-        "code_files": len(scan["code_files"]),
-        "doc_files": len(scan["doc_files"]),
-        "txt_files": len(scan["txt_files"]),
-        "filtered": scan["stats"]["filtered"],
+        "stats": scan["stats"],
     })
 
     # --- Step 2: Convert TXT → MD ---
@@ -551,7 +549,8 @@ async def auto_pipeline(request: PipelineRequest):
         "converted": len(converted),
     })
 
-    # --- Step 3: Ingest (C++ + MD) ---
+    # --- Step 3: Ingest ---
+    # 3a: C++ через Tree-sitter (жёсткие связи AST)
     cpp_parser = CPPSymbolExtractor(directory)
     md_parser = MarkdownParser(directory)
 
@@ -559,7 +558,7 @@ async def auto_pipeline(request: PipelineRequest):
     all_edges = []
     errors = []
 
-    for fp in scan["code_files"]:
+    for fp in scan["cpp_files"]:
         try:
             result = cpp_parser.parse_file(fp)
             if result.success:
@@ -570,8 +569,20 @@ async def auto_pipeline(request: PipelineRequest):
         except Exception as e:
             errors.append(str(e))
 
+    # 3b: Документация (.md, .rst) через MD-парсер
     md_mentions = []
     for fp in scan["doc_files"]:
+        try:
+            result = md_parser.parse_file(fp)
+            if result.success and result.node:
+                all_nodes.append(result.node)
+                md_mentions.append((result.node.node_id, result.mentions))
+        except Exception as e:
+            errors.append(str(e))
+
+    # 3c: Всё остальное текстовое (.py, .json, .yaml, .log, .sql, etc.)
+    # → парсим как DOCUMENT через MD-парсер (он работает с любым текстом)
+    for fp in scan.get("other_text", []):
         try:
             result = md_parser.parse_file(fp)
             if result.success and result.node:
