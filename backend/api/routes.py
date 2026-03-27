@@ -21,6 +21,7 @@ from ..parser.cpp_parser import CPPSymbolExtractor, scan_directory
 from ..parser.md_parser import MarkdownParser, resolve_mentions_to_edges
 from ..parser.txt_converter import scan_and_filter, convert_txt_files
 from ..llm.embeddings import VectorStore, get_embedding, get_embeddings_batch
+from ..llm.entity_extractor import extract_entities_batch, resolve_entities
 
 logger = logging.getLogger(__name__)
 
@@ -538,10 +539,12 @@ async def auto_pipeline(request: PipelineRequest):
         "stats": scan["stats"],
     })
 
-    # --- Step 2: Convert TXT → MD ---
+    # --- Step 2: Convert TXT → MD (в temp-директорию, не в исходники) ---
     converted = []
     if scan["txt_files"]:
-        converted = convert_txt_files(scan["txt_files"])
+        import tempfile
+        tmp_dir = os.path.join(tempfile.gettempdir(), "graphrag_converted")
+        converted = convert_txt_files(scan["txt_files"], output_dir=tmp_dir, source_root=directory)
         scan["doc_files"].extend(converted)
     steps.append({
         "step": "convert_txt",
@@ -738,48 +741,62 @@ async def vector_search(request: VectorSearchRequest):
 @router.post("/index/embeddings")
 async def index_embeddings():
     """
-    Генерирует эмбеддинги для всех узлов графа и сохраняет в Qdrant.
-    Вызывается после ingest, чтобы активировать векторный поиск.
+    Генерирует эмбеддинги для ВСЕХ узлов графа и сохраняет в Qdrant.
+    Обрабатывает порциями по 500 узлов чтобы не переполнить RAM.
     """
     s = get_storage()
     vs = get_vector_store()
 
-    # Забираем все узлы из Neo4j
-    all_nodes = s.search_nodes(limit=1000)
-    if not all_nodes:
+    # Считаем общее кол-во узлов
+    total_in_graph = s.count_nodes()
+    if total_in_graph == 0:
         return {"indexed": 0, "message": "No nodes in graph"}
 
-    # Формируем текст для эмбеддинга: name + summary + type
-    texts = []
-    for node in all_nodes:
-        text = f"{node.type}: {node.name}"
-        if node.summary:
-            text += f" - {node.summary}"
-        if node.signature:
-            text += f" ({node.signature})"
-        texts.append(text)
+    total_indexed = 0
+    chunk_size = 500
+    offset = 0
 
-    # Батч-генерация эмбеддингов через Gemini
-    embeddings = await get_embeddings_batch(texts)
+    while offset < total_in_graph:
+        # Забираем порцию узлов
+        nodes_chunk = s.search_nodes(limit=chunk_size, skip=offset)
+        if not nodes_chunk:
+            break
 
-    # Сохраняем в Qdrant
-    items = []
-    for node, emb in zip(all_nodes, embeddings):
-        if emb is None:
-            continue
-        items.append({
-            "node_id": node.node_id,
-            "embedding": emb,
-            "payload": {
-                "type": node.type,
-                "name": node.name,
-                "summary": node.summary,
-                "file_path": node.file_path,
-            }
-        })
+        # Формируем текст для эмбеддинга
+        texts = []
+        for node in nodes_chunk:
+            text = f"{node.type}: {node.name}"
+            if node.summary:
+                text += f" - {node.summary}"
+            if node.signature:
+                text += f" ({node.signature})"
+            texts.append(text)
 
-    count = vs.upsert_batch(items)
-    return {"indexed": count, "total_nodes": len(all_nodes)}
+        # Батч-генерация эмбеддингов через Gemini
+        embeddings = await get_embeddings_batch(texts)
+
+        # Сохраняем в Qdrant
+        items = []
+        for node, emb in zip(nodes_chunk, embeddings):
+            if emb is None:
+                continue
+            items.append({
+                "node_id": node.node_id,
+                "embedding": emb,
+                "payload": {
+                    "type": node.type,
+                    "name": node.name,
+                    "summary": node.summary,
+                    "file_path": node.file_path,
+                }
+            })
+
+        count = vs.upsert_batch(items)
+        total_indexed += count
+        offset += len(nodes_chunk)
+        logger.info(f"Embeddings: {total_indexed}/{total_in_graph} indexed")
+
+    return {"indexed": total_indexed, "total_nodes": total_in_graph}
 
 
 # ============== Phase C: LLM Summary Generation ==============
@@ -954,3 +971,266 @@ async def clear_scratchpad(session_id: str):
     """Очистка Scratchpad сессии"""
     removed = len(_scratchpads.pop(session_id, []))
     return {"session_id": session_id, "removed": removed}
+
+
+# ============== Agent Query (RAG) ==============
+
+class AgentQueryRequest(BaseModel):
+    question: str = Field(..., description="Вопрос к агенту")
+    top_k: int = Field(default=10, description="Кол-во узлов из vector search")
+    depth: int = Field(default=1, description="Глубина subgraph вокруг найденных узлов")
+
+
+@router.post("/agent/query")
+async def agent_query(request: AgentQueryRequest):
+    """
+    RAG-запрос: vector search → subgraph context → LLM answer.
+
+    Полный цикл GraphRAG с метриками:
+    1. Эмбеддинг вопроса → Qdrant vector search → top_k стартовых узлов
+    2. Для каждого узла — get_subgraph(depth) → контекст
+    3. Собираем промпт с контекстом → Gemini → ответ
+    4. Возвращаем ответ + метрики (токены, время, узлы)
+    """
+    import time
+    start = time.time()
+
+    s = get_storage()
+    vs = get_vector_store()
+    from ..llm.client import get_llm_client
+    client = get_llm_client()
+
+    if not client.api_key:
+        raise HTTPException(status_code=503, detail="LLM API key not configured")
+
+    # Step 1: Vector search
+    query_embedding = await get_embedding(request.question)
+    if not query_embedding:
+        raise HTTPException(status_code=503, detail="Failed to generate query embedding")
+
+    vector_results = vs.search(
+        query_vector=query_embedding,
+        limit=request.top_k,
+    )
+
+    if not vector_results:
+        raise HTTPException(status_code=404, detail="No relevant nodes found")
+
+    # Step 2: Expand context via subgraph
+    context_nodes = {}  # node_id -> node_info
+    context_edges = []
+
+    for vr in vector_results:
+        node_id = vr.get("node_id", "")
+        if not node_id:
+            continue
+        # Get the node itself
+        node = s.get_node(node_id)
+        if node:
+            context_nodes[node_id] = node
+        # Expand subgraph
+        subgraph = s.get_subgraph(node_id, depth=request.depth)
+        if subgraph:
+            for n in subgraph.nodes:
+                if n.node_id not in context_nodes:
+                    context_nodes[n.node_id] = n
+            context_edges.extend(subgraph.edges)
+
+    # Step 3: Build prompt with context
+    context_parts = []
+    for nid, node in context_nodes.items():
+        info = f"[{node.type}] {node.name}"
+        if node.signature:
+            info += f" | signature: {node.signature}"
+        if node.summary:
+            info += f" | summary: {node.summary}"
+        if node.file_path:
+            info += f" | file: {node.file_path}"
+        # Include source code for small nodes (< 2000 chars)
+        if node.source_code and len(node.source_code) < 2000:
+            info += f"\n```\n{node.source_code}\n```"
+        context_parts.append(info)
+
+    edge_parts = []
+    seen_edges = set()
+    for e in context_edges:
+        key = f"{e.source_id}->{e.target_id}:{e.type}"
+        if key not in seen_edges:
+            seen_edges.add(key)
+            edge_parts.append(f"  {e.source_id} --[{e.type}]--> {e.target_id}")
+
+    context_text = "\n\n".join(context_parts)
+    edges_text = "\n".join(edge_parts[:50])  # Limit edges
+
+    system_prompt = (
+        "You are an expert code analyst with access to a graph knowledge base. "
+        "Answer questions based ONLY on the provided context from the codebase graph. "
+        "If the context doesn't contain enough information, say so explicitly. "
+        "Always reference specific files, classes, or functions when possible. "
+        "Answer in the same language as the question."
+    )
+
+    user_prompt = f"""QUESTION: {request.question}
+
+GRAPH CONTEXT ({len(context_nodes)} nodes, {len(seen_edges)} edges):
+
+{context_text}
+
+RELATIONSHIPS:
+{edges_text}
+
+Based on this context, provide a detailed answer to the question."""
+
+    context_chars = len(user_prompt)
+
+    # Step 4: Call LLM with metrics
+    result = await client.generate_with_metrics(user_prompt, system_prompt)
+
+    total_time = round(time.time() - start, 2)
+
+    return {
+        "question": request.question,
+        "answer": result["text"],
+        "metrics": {
+            "total_time_s": total_time,
+            "llm_time_s": result["time_s"],
+            "input_tokens": result["input_tokens"],
+            "output_tokens": result["output_tokens"],
+            "total_tokens": result["total_tokens"],
+            "context_nodes": len(context_nodes),
+            "context_edges": len(seen_edges),
+            "context_chars": context_chars,
+            "vector_results": len(vector_results),
+        },
+        "sources": [
+            {"node_id": nid, "type": n.type, "name": n.name, "file": n.file_path}
+            for nid, n in list(context_nodes.items())[:20]
+        ],
+    }
+
+
+# ============== Entity Extraction ==============
+
+@router.post("/extract/entities")
+async def extract_entities_from_graph():
+    """
+    Извлекает сущности (ENTITY, FACT, TOPIC, SKILL) из всех узлов графа.
+    Создаёт новые узлы-сущности и семантические рёбра.
+    Обрабатывает порциями по 10 узлов за один LLM-вызов.
+    """
+    import hashlib
+    import math
+
+    s = get_storage()
+    from ..llm.client import get_llm_client
+    client = get_llm_client()
+
+    if not client.api_key:
+        raise HTTPException(status_code=503, detail="LLM API key not configured")
+
+    # Забираем все узлы порциями
+    total_in_graph = s.count_nodes()
+    if total_in_graph == 0:
+        return {"message": "No nodes in graph"}
+
+    all_items = []
+    offset = 0
+    chunk_size = 500
+
+    while offset < total_in_graph:
+        nodes = s.search_nodes(limit=chunk_size, skip=offset)
+        if not nodes:
+            break
+        for node in nodes:
+            content = node.source_code or node.summary or node.name
+            if len(content.strip()) < 20:
+                continue
+            all_items.append({
+                "node_id": node.node_id,
+                "name": node.name,
+                "type": node.type,
+                "content": content,
+            })
+        offset += len(nodes)
+
+    logger.info(f"Entity extraction: {len(all_items)} nodes to process")
+
+    # Батч-экстракция
+    entities, edges = await extract_entities_batch(client, all_items, batch_size=10)
+    logger.info(f"Extracted: {len(entities)} entities, {len(edges)} edges")
+
+    # Entity resolution (дедупликация)
+    name_map = resolve_entities(entities)
+
+    # Создаём узлы-сущности в Neo4j
+    entity_nodes = {}  # canonical_name → GraphNode
+    for ent in entities:
+        canonical = name_map.get(ent.name, ent.name)
+        if canonical in entity_nodes:
+            continue  # Уже создан
+
+        node_id = f"entity::{hashlib.md5(canonical.encode()).hexdigest()[:12]}"
+        entity_nodes[canonical] = GraphNode(
+            node_id=node_id,
+            type=ent.type,
+            name=canonical,
+            signature="",
+            file_path="",
+            line_start=0,
+            line_end=0,
+            source_code="",
+            summary=ent.summary,
+            tags=[],
+        )
+
+    # Bulk insert entity nodes
+    new_nodes = list(entity_nodes.values())
+    if new_nodes:
+        created = s.bulk_create_nodes(new_nodes)
+        logger.info(f"Created {created} entity nodes")
+
+    # Создаём семантические рёбра
+    # 1) source_node → entity (MENTIONS)
+    semantic_edges = []
+    for ent in entities:
+        canonical = name_map.get(ent.name, ent.name)
+        if canonical not in entity_nodes:
+            continue
+        entity_node = entity_nodes[canonical]
+
+        semantic_edges.append(GraphEdge(
+            source_id=ent.source_node_id,
+            target_id=entity_node.node_id,
+            edge_type="MENTIONS",
+            metadata={"confidence": ent.confidence, "weight": ent.confidence},
+        ))
+
+    # 2) entity → entity edges from extractor
+    for ed in edges:
+        src_canonical = name_map.get(ed.source_name, ed.source_name)
+        tgt_canonical = name_map.get(ed.target_name, ed.target_name)
+        if src_canonical not in entity_nodes or tgt_canonical not in entity_nodes:
+            continue
+
+        semantic_edges.append(GraphEdge(
+            source_id=entity_nodes[src_canonical].node_id,
+            target_id=entity_nodes[tgt_canonical].node_id,
+            edge_type=ed.edge_type,
+            metadata={"weight": ed.weight},
+        ))
+
+    # Bulk insert edges
+    if semantic_edges:
+        edge_count = s.bulk_create_edges(semantic_edges)
+        logger.info(f"Created {edge_count} semantic edges")
+
+    api_calls = math.ceil(len(all_items) / 10)
+
+    return {
+        "total_source_nodes": len(all_items),
+        "entities_extracted": len(entities),
+        "unique_entities": len(entity_nodes),
+        "semantic_edges": len(semantic_edges),
+        "entity_resolution_merges": sum(1 for k, v in name_map.items() if k != v),
+        "api_calls": api_calls,
+    }

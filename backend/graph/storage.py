@@ -178,29 +178,31 @@ class Neo4jStorage:
             result = session.run(cypher, node_id=node.node_id, summary=node.summary)
             return result.single() is not None
 
-    def bulk_create_nodes(self, nodes: List[GraphNode]) -> int:
-        """Массовое создание узлов в транзакции"""
+    def bulk_create_nodes(self, nodes: List[GraphNode], chunk_size: int = 500) -> int:
+        """Массовое создание узлов. Коммитит порциями по chunk_size для больших проектов."""
         count = 0
-        with self._driver.session(database=self.database) as session:
-            with session.begin_transaction() as tx:
-                for node in nodes:
-                    node.tags = validate_tags(node.tags)
-                    cypher = """
-                    MERGE (n:Node {node_id: $node_id})
-                    SET n.type = $type,
-                        n.name = $name,
-                        n.signature = $signature,
-                        n.file_path = $file_path,
-                        n.line_start = $line_start,
-                        n.line_end = $line_end,
-                        n.source_code = $source_code,
-                        n.summary = $summary,
-                        n.tags = $tags,
-                        n.updated_at = datetime()
-                    """
-                    tx.run(cypher, **node.to_dict())
-                    count += 1
-                tx.commit()
+        for i in range(0, len(nodes), chunk_size):
+            chunk = nodes[i:i + chunk_size]
+            with self._driver.session(database=self.database) as session:
+                with session.begin_transaction() as tx:
+                    for node in chunk:
+                        node.tags = validate_tags(node.tags)
+                        cypher = """
+                        MERGE (n:Node {node_id: $node_id})
+                        SET n.type = $type,
+                            n.name = $name,
+                            n.signature = $signature,
+                            n.file_path = $file_path,
+                            n.line_start = $line_start,
+                            n.line_end = $line_end,
+                            n.source_code = $source_code,
+                            n.summary = $summary,
+                            n.tags = $tags,
+                            n.updated_at = datetime()
+                        """
+                        tx.run(cypher, **node.to_dict())
+                        count += 1
+                    tx.commit()
         return count
     
     # ============== Edge Operations ==============
@@ -236,24 +238,25 @@ class Neo4jStorage:
             record = result.single()
             return record and record["deleted"] > 0
     
-    def bulk_create_edges(self, edges: List[GraphEdge]) -> int:
-        """Массовое создание ребер"""
+    def bulk_create_edges(self, edges: List[GraphEdge], chunk_size: int = 500) -> int:
+        """Массовое создание ребер. Коммитит порциями."""
         count = 0
-        with self._driver.session(database=self.database) as session:
-            with session.begin_transaction() as tx:
-                for edge in edges:
-                    cypher = """
-                    MATCH (source:Node {node_id: $source_id})
-                    MATCH (target:Node {node_id: $target_id})
-                    MERGE (source)-[e:EDGE]->(target)
-                    SET e.type = $type, e.metadata = $metadata, e.created_at = datetime()
-                    """
-                    params = edge.to_dict()
-                    import json as _json
-                    params["metadata"] = _json.dumps(params.get("metadata", {}))
-                    tx.run(cypher, **params)
-                    count += 1
-                tx.commit()
+        for i in range(0, len(edges), chunk_size):
+            chunk = edges[i:i + chunk_size]
+            with self._driver.session(database=self.database) as session:
+                with session.begin_transaction() as tx:
+                    for edge in chunk:
+                        cypher = """
+                        MATCH (source:Node {node_id: $source_id})
+                        MATCH (target:Node {node_id: $target_id})
+                        MERGE (source)-[e:EDGE]->(target)
+                        SET e.type = $type, e.metadata = $metadata, e.created_at = datetime()
+                        """
+                        params = edge.to_dict()
+                        params["metadata"] = json.dumps(params.get("metadata", {}))
+                        tx.run(cypher, **params)
+                        count += 1
+                    tx.commit()
         return count
     
     # ============== Navigation ==============
@@ -359,19 +362,26 @@ class Neo4jStorage:
     
     # ============== Search ==============
     
+    def count_nodes(self) -> int:
+        """Общее кол-во узлов в графе"""
+        with self._driver.session(database=self.database) as session:
+            result = session.run("MATCH (n:Node) RETURN count(n) as cnt")
+            return result.single()["cnt"]
+
     def search_nodes(
         self,
         query: str = None,
         node_type: str = None,
         tags: List[str] = None,
-        limit: int = 50
+        limit: int = 50,
+        skip: int = 0
     ) -> List[GraphNode]:
         """
         Поиск узлов по различным критериям.
-        Используется как fallback если векторный поиск недоступен.
+        Поддерживает пагинацию через skip.
         """
         conditions = []
-        params: Dict[str, Any] = {"lim": limit}
+        params: Dict[str, Any] = {"lim": limit, "skp": skip}
 
         if query:
             conditions.append("(n.name CONTAINS $q OR n.signature CONTAINS $q)")
@@ -391,7 +401,8 @@ class Neo4jStorage:
         MATCH (n:Node)
         WHERE {where_clause}
         RETURN n
-        ORDER BY n.updated_at DESC
+        ORDER BY n.node_id
+        SKIP $skp
         LIMIT $lim
         """
 

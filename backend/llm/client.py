@@ -80,8 +80,34 @@ class LLMClient:
 
         return await handler(prompt, system)
 
-    async def _call_gemini(self, prompt: str, system: str = "") -> str:
-        """Google Gemini API (REST, без SDK)"""
+    async def generate_with_metrics(self, prompt: str, system: str = "") -> dict:
+        """
+        Генерация с возвратом метрик (токены, время).
+        Returns: {"text": str, "input_tokens": int, "output_tokens": int, "total_tokens": int}
+        """
+        import time
+        start = time.time()
+
+        if not self.api_key:
+            return {"text": "", "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "time_s": 0}
+
+        if self.provider == "gemini":
+            result = await self._call_gemini_with_metrics(prompt, system)
+        else:
+            text = await self.generate(prompt, system)
+            # Rough estimation for non-Gemini providers
+            result = {
+                "text": text,
+                "input_tokens": len(prompt) // 4,
+                "output_tokens": len(text) // 4,
+                "total_tokens": (len(prompt) + len(text)) // 4,
+            }
+
+        result["time_s"] = round(time.time() - start, 2)
+        return result
+
+    async def _call_gemini_with_metrics(self, prompt: str, system: str = "") -> dict:
+        """Gemini API с возвратом usage metadata"""
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{self.model}:generateContent?key={self.api_key}"
@@ -100,13 +126,25 @@ class LLMClient:
             if resp.status != 200:
                 error = await resp.text()
                 logger.error(f"Gemini API error {resp.status}: {error}")
-                return ""
+                return {"text": "", "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
             data = await resp.json()
             try:
-                return data["candidates"][0]["content"]["parts"][0]["text"]
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
             except (KeyError, IndexError):
-                logger.error(f"Unexpected Gemini response: {data}")
-                return ""
+                text = ""
+
+            usage = data.get("usageMetadata", {})
+            return {
+                "text": text,
+                "input_tokens": usage.get("promptTokenCount", 0),
+                "output_tokens": usage.get("candidatesTokenCount", 0),
+                "total_tokens": usage.get("totalTokenCount", 0),
+            }
+
+    async def _call_gemini(self, prompt: str, system: str = "") -> str:
+        """Google Gemini API (REST, без SDK)"""
+        result = await self._call_gemini_with_metrics(prompt, system)
+        return result["text"]
 
     async def _call_openai(self, prompt: str, system: str = "") -> str:
         """OpenAI-совместимый API (GPT, Groq, Together, etc.)"""

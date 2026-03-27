@@ -61,6 +61,8 @@ SKIP_DIRS = {
     '.vs', '.vscode', '.idea', 'build', 'Build', 'cmake-build',
     'Debug', 'Release', 'x64', 'x86', '.cache', 'out',
     'bin', 'obj', 'dist', '.gradle', 'target',
+    # Toolchains — пропускаем для MVP, нагрузочный тест отдельно
+    'tools', 'external', 'mingw64', 'mingw32',
 }
 
 SKIP_FILES = {
@@ -259,20 +261,31 @@ def scan_and_filter(root_dir: str) -> dict:
     }
 
 
-def convert_txt_files(txt_files: List[str], output_dir: str = None) -> List[str]:
+def convert_txt_files(txt_files: List[str], output_dir: str = None, source_root: str = None) -> List[str]:
     """
     Конвертирует .txt файлы в .md.
     Возвращает пути к созданным .md файлам.
 
+    Если output_dir указан — сохраняет структуру папок внутри него
+    (избегает коллизий имён из разных поддиректорий).
     Если output_dir не указан — создаёт .md рядом с .txt.
     """
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     created = []
     for txt_path in txt_files:
         try:
             md_content = txt_to_markdown(txt_path)
             if output_dir:
-                basename = os.path.splitext(os.path.basename(txt_path))[0] + '.md'
-                md_path = os.path.join(output_dir, basename)
+                # Сохраняем структуру папок: /app/Project/src/foo.txt → /tmp/conv/src/foo.md
+                if source_root:
+                    rel = os.path.relpath(txt_path, source_root)
+                else:
+                    rel = os.path.basename(txt_path)
+                md_rel = os.path.splitext(rel)[0] + '.md'
+                md_path = os.path.join(output_dir, md_rel)
+                os.makedirs(os.path.dirname(md_path), exist_ok=True)
             else:
                 md_path = os.path.splitext(txt_path)[0] + '.md'
 

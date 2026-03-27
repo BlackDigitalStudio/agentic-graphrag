@@ -11,7 +11,8 @@ import json
 
 
 class NodeType(Enum):
-    """Типы узлов графа"""
+    """Типы узлов графа — универсальная схема для кода, текста и знаний"""
+    # === Код (AST) ===
     FILE = "file"
     CLASS = "class"
     FUNCTION = "function"
@@ -21,29 +22,48 @@ class NodeType(Enum):
     ENUM = "enum"
     STRUCT = "struct"
     INTERFACE = "interface"
-    DOCUMENT = "document"  # Для документации (Фаза B)
-    PLAN = "plan"  # Планы агента (Фаза B)
+
+    # === Документы ===
+    DOCUMENT = "document"      # Любой текстовый документ / чанк диалога
+    PLAN = "plan"              # Планы агента
+
+    # === Универсальные сущности (Knowledge Graph) ===
+    ENTITY = "entity"          # Именованная сущность: персона, продукт, технология, место
+    TOPIC = "topic"            # Тематический кластер: "cooking", "finance", "physics_engine"
+    FACT = "fact"              # Конкретный факт: "user knows Python", "Bitcoin ATH = $108K"
+    SKILL = "skill"            # Навык/компетенция: "C++ expert", "knows React"
+    PREFERENCE = "preference"  # Предпочтение пользователя: "prefers dark mode"
 
 
 class EdgeType(Enum):
-    """Типы связей (строго типизированные)"""
-    CALLS = "CALLS"           # Функция вызывает другую
-    INCLUDES = "INCLUDES"      # Файл включает другой
-    IMPLEMENTS = "IMPLEMENTS"  # Класс реализует интерфейс
-    INHERITS = "INHERITS"      # Класс наследует другой
-    DEPENDS_ON = "DEPENDS_ON"  # Общая зависимость
-    DEFINES = "DEFINES"        # Класс/файл определяет функцию
-    HAS_METHOD = "HAS_METHOD"  # Класс имеет метод
-    RELATES_TO = "RELATES_TO"  # Общая связь
-    DESCRIBES = "DESCRIBES"    # Документ описывает код
+    """Типы связей — структурные (AST) + семантические (Knowledge Graph)"""
+    # === Структурные (детерминированные, из AST) ===
+    CALLS = "CALLS"
+    INCLUDES = "INCLUDES"
+    IMPLEMENTS = "IMPLEMENTS"
+    INHERITS = "INHERITS"
+    DEPENDS_ON = "DEPENDS_ON"
+    DEFINES = "DEFINES"
+    HAS_METHOD = "HAS_METHOD"
+
+    # === Семантические (из entity extractor) ===
+    RELATES_TO = "RELATES_TO"        # Общая связь между сущностями
+    DESCRIBES = "DESCRIBES"          # Документ описывает код/сущность
+    MENTIONS = "MENTIONS"            # Контент упоминает сущность
+    REVEALS = "REVEALS"              # Контент раскрывает факт ("я python-разработчик")
+    BELONGS_TO = "BELONGS_TO"        # Сущность принадлежит топику
+    CONTRADICTS = "CONTRADICTS"      # Факт противоречит другому факту
+    SAME_AS = "SAME_AS"              # Entity resolution: два узла = одна сущность
+    SKILLED_IN = "SKILLED_IN"        # Персона владеет навыком
+    SUPERSEDES = "SUPERSEDES"        # Новый факт заменяет старый (temporal)
 
 
 class TagEnum(Enum):
     """
-    Жесткий Enum для тегов архитектуры.
+    Жесткий Enum для тегов.
     LLM НЕ может генерировать новые теги.
     """
-    # Архитектурные теги
+    # Архитектурные теги (код)
     CORE = "core"
     UTILITY = "utility"
     CONFIG = "config"
@@ -54,22 +74,34 @@ class TagEnum(Enum):
     API = "api"
     MIDDLEWARE = "middleware"
     HANDLER = "handler"
-    
+
     # Статусные теги
     ABSTRACT = "abstract"
     INTERFACE = "interface"
     CONCRETE = "concrete"
     DEPRECATED = "deprecated"
-    
+
     # Теги компонентов
     ENTRY_POINT = "entry_point"
     TEST = "test"
     MOCK = "mock"
-    
-    # Семантические теги
+
+    # Семантические теги (код)
     BUSINESS_LOGIC = "business_logic"
     INFRASTRUCTURE = "infrastructure"
     BOUNDED_CONTEXT = "bounded_context"
+
+    # Универсальные теги (знания)
+    PERSONAL = "personal"           # Факт о пользователе
+    TECHNICAL = "technical"         # Техническая информация
+    CREATIVE = "creative"           # Творческий контент
+    FINANCIAL = "financial"         # Финансы / крипто / инвестиции
+    HEALTH = "health"               # Здоровье
+    SOCIAL = "social"               # Общение / отношения
+    EDUCATION = "education"         # Обучение / книги / курсы
+    PHILOSOPHY = "philosophy"       # Философия / религия / мировоззрение
+    ENTERTAINMENT = "entertainment" # Развлечения / ранобе / игры
+    TOOLCHAIN = "toolchain"         # Инструменты сборки / CI/CD
 
 
 @dataclass

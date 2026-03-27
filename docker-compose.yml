@@ -62,6 +62,11 @@ services:
     volumes:
       - ./backend:/app/backend
       - ./test_data:/app/test_data
+      - /c/Dev/ArcaneDepths:/app/ArcaneDepths:ro
+    deploy:
+      resources:
+        limits:
+          memory: 3G
 
 volumes:
   neo4j_data:

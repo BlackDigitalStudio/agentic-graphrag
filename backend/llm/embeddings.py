@@ -92,29 +92,33 @@ class VectorStore:
 
     def upsert_batch(
         self,
-        items: List[Dict[str, Any]]
+        items: List[Dict[str, Any]],
+        chunk_size: int = 200
     ) -> int:
         """
-        Батч-вставка. Каждый item: {node_id, embedding, payload}
+        Батч-вставка с чанкированием. Каждый item: {node_id, embedding, payload}
         """
         if not self.client:
             return 0
-        points = []
-        for item in items:
-            points.append(PointStruct(
-                id=self._node_id_to_int(item["node_id"]),
-                vector=item["embedding"],
-                payload={"node_id": item["node_id"], **item["payload"]}
-            ))
-        try:
-            self.client.upsert(
-                collection_name=self.collection,
-                points=points
-            )
-            return len(points)
-        except Exception as e:
-            logger.error(f"Qdrant batch upsert failed: {e}")
-            return 0
+        total = 0
+        for i in range(0, len(items), chunk_size):
+            chunk = items[i:i + chunk_size]
+            points = []
+            for item in chunk:
+                points.append(PointStruct(
+                    id=self._node_id_to_int(item["node_id"]),
+                    vector=item["embedding"],
+                    payload={"node_id": item["node_id"], **item["payload"]}
+                ))
+            try:
+                self.client.upsert(
+                    collection_name=self.collection,
+                    points=points
+                )
+                total += len(points)
+            except Exception as e:
+                logger.error(f"Qdrant chunk upsert failed ({i}-{i+len(chunk)}): {e}")
+        return total
 
     def search(
         self,
