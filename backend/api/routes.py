@@ -3,15 +3,23 @@ Agentic GraphRAG - API Routes
 FastAPI эндпоинты для взаимодействия с LLM-агентом
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Query, UploadFile, File
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import logging
+import os
+import zipfile
+import tempfile
+import shutil
+import asyncio
+import json as _json
 
 from ..graph.models import GraphNode, GraphEdge, SubgraphResult, IngestResult, VirtualPatch
 from ..graph.storage import Neo4jStorage
 from ..parser.cpp_parser import CPPSymbolExtractor, scan_directory
 from ..parser.md_parser import MarkdownParser, resolve_mentions_to_edges
+from ..parser.txt_converter import scan_and_filter, convert_txt_files
 from ..llm.embeddings import VectorStore, get_embedding, get_embeddings_batch
 
 logger = logging.getLogger(__name__)
@@ -442,6 +450,213 @@ async def get_allowed_tags():
     """Получение списка допустимых тегов"""
     from ..graph.models import TagEnum
     return [t.value for t in TagEnum]
+
+
+# ============== Upload & Auto-Pipeline ==============
+
+UPLOAD_DIR = "/app/uploads"
+
+
+@router.post("/upload")
+async def upload_project(file: UploadFile = File(...)):
+    """
+    Загрузка проекта через браузер (ZIP-архив или отдельные файлы).
+    Распаковывает в /app/uploads/{project_name}/ внутри контейнера.
+    """
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+    # Определяем имя проекта
+    original = file.filename or "project"
+    project_name = os.path.splitext(original)[0]
+    project_dir = os.path.join(UPLOAD_DIR, project_name)
+
+    # Читаем файл
+    content = await file.read()
+
+    if original.endswith('.zip'):
+        # ZIP — распаковываем
+        os.makedirs(project_dir, exist_ok=True)
+        tmp = os.path.join(UPLOAD_DIR, original)
+        with open(tmp, 'wb') as f:
+            f.write(content)
+        with zipfile.ZipFile(tmp, 'r') as z:
+            z.extractall(project_dir)
+        os.remove(tmp)
+    else:
+        # Одиночный файл
+        os.makedirs(project_dir, exist_ok=True)
+        with open(os.path.join(project_dir, original), 'wb') as f:
+            f.write(content)
+
+    # Сканируем и фильтруем
+    scan = scan_and_filter(project_dir)
+
+    return {
+        "project_name": project_name,
+        "project_dir": project_dir,
+        "scan": scan["stats"],
+        "code_files": len(scan["code_files"]),
+        "doc_files": len(scan["doc_files"]),
+        "txt_files": len(scan["txt_files"]),
+    }
+
+
+class PipelineRequest(BaseModel):
+    directory: Optional[str] = None
+    project_name: Optional[str] = None
+
+
+@router.post("/pipeline")
+async def auto_pipeline(request: PipelineRequest):
+    """
+    Автоматический пайплайн: конвертация → индексация → эмбеддинги → summary.
+
+    Одна кнопка — полная обработка проекта.
+    Принимает directory ИЛИ project_name (из /upload).
+    """
+    from ..llm.client import get_llm_client
+    import math
+
+    directory = request.directory
+    project_name = request.project_name
+    if project_name:
+        directory = os.path.join(UPLOAD_DIR, project_name)
+    if not directory or not os.path.isdir(directory):
+        raise HTTPException(status_code=400, detail=f"Directory not found: {directory}")
+
+    s = get_storage()
+    vs = get_vector_store()
+    client = get_llm_client()
+    steps = []
+
+    # --- Step 1: Scan & Filter ---
+    scan = scan_and_filter(directory)
+    steps.append({
+        "step": "scan",
+        "status": "done",
+        "code_files": len(scan["code_files"]),
+        "doc_files": len(scan["doc_files"]),
+        "txt_files": len(scan["txt_files"]),
+        "filtered": scan["stats"]["filtered"],
+    })
+
+    # --- Step 2: Convert TXT → MD ---
+    converted = []
+    if scan["txt_files"]:
+        converted = convert_txt_files(scan["txt_files"])
+        scan["doc_files"].extend(converted)
+    steps.append({
+        "step": "convert_txt",
+        "status": "done",
+        "converted": len(converted),
+    })
+
+    # --- Step 3: Ingest (C++ + MD) ---
+    cpp_parser = CPPSymbolExtractor(directory)
+    md_parser = MarkdownParser(directory)
+
+    all_nodes = []
+    all_edges = []
+    errors = []
+
+    for fp in scan["code_files"]:
+        try:
+            result = cpp_parser.parse_file(fp)
+            if result.success:
+                all_nodes.extend(result.nodes)
+                all_edges.extend(result.edges)
+            else:
+                errors.append(result.error)
+        except Exception as e:
+            errors.append(str(e))
+
+    md_mentions = []
+    for fp in scan["doc_files"]:
+        try:
+            result = md_parser.parse_file(fp)
+            if result.success and result.node:
+                all_nodes.append(result.node)
+                md_mentions.append((result.node.node_id, result.mentions))
+        except Exception as e:
+            errors.append(str(e))
+
+    if all_nodes:
+        s.bulk_create_nodes(all_nodes)
+    if all_edges:
+        s.bulk_create_edges(all_edges)
+
+    # Auto-link docs → code
+    code_nodes = [n for n in all_nodes if n.type != "document"]
+    describe_edges = []
+    for doc_id, mentions in md_mentions:
+        describe_edges.extend(resolve_mentions_to_edges(doc_id, mentions, code_nodes))
+    if describe_edges:
+        s.bulk_create_edges(describe_edges)
+        all_edges.extend(describe_edges)
+
+    steps.append({
+        "step": "ingest",
+        "status": "done",
+        "nodes": len(all_nodes),
+        "edges": len(all_edges),
+        "errors": len(errors),
+    })
+
+    # --- Step 4: Embeddings ---
+    emb_count = 0
+    if all_nodes:
+        texts = [
+            f"{n.type}: {n.name} - {n.summary} ({n.signature})"
+            for n in all_nodes
+        ]
+        embeddings = await get_embeddings_batch(texts)
+        items = []
+        for node, emb in zip(all_nodes, embeddings):
+            if emb:
+                items.append({
+                    "node_id": node.node_id,
+                    "embedding": emb,
+                    "payload": {
+                        "type": node.type, "name": node.name,
+                        "summary": node.summary, "file_path": node.file_path,
+                    }
+                })
+        emb_count = vs.upsert_batch(items)
+
+    steps.append({"step": "embeddings", "status": "done", "indexed": emb_count})
+
+    # --- Step 5: Summaries ---
+    sum_count = 0
+    api_calls = 0
+    if client.api_key:
+        needs = [n for n in all_nodes if n.source_code
+                 and (not n.summary or n.summary.startswith(("Class ", "Function ", "Document")))]
+        if needs:
+            summaries = await client.batch_summarize(needs, batch_size=30)
+            for node in needs:
+                if node.node_id in summaries:
+                    node.summary = summaries[node.node_id]
+                    s.update_node(node)
+                    sum_count += 1
+            api_calls = math.ceil(len(needs) / 30)
+
+    steps.append({
+        "step": "summaries",
+        "status": "done",
+        "updated": sum_count,
+        "api_calls": api_calls,
+    })
+
+    total_files = len(scan["code_files"]) + len(scan["doc_files"])
+    return {
+        "success": True,
+        "project_dir": directory,
+        "total_files": total_files,
+        "total_nodes": len(all_nodes),
+        "total_edges": len(all_edges),
+        "steps": steps,
+        "errors": errors[:10],  # Первые 10 ошибок
+    }
 
 
 # ============== Bulk Operations (N+1 fix) ==============

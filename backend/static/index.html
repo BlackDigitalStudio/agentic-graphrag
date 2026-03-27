@@ -110,19 +110,43 @@ pre{background:var(--bg);border:1px solid var(--border);border-radius:6px;paddin
 
 <!-- Ingest -->
 <div class="panel" id="panel-ingest">
-  <h2 style="margin-bottom:16px">Ingest — Загрузка проекта</h2>
-  <div class="card">
-    <label>Путь к директории (внутри контейнера)</label>
-    <div class="row">
-      <input id="ingestDir" value="/app/test_data/cpp_project" placeholder="/app/test_data/cpp_project">
-      <button class="btn" onclick="doIngest()" style="flex:none">Ingest</button>
-    </div>
-    <p style="font-size:11px;color:var(--muted);margin-top:4px">
-      Папка должна быть примонтирована в docker-compose.yml (volumes).
-      По умолчанию: test_data → /app/test_data
-    </p>
+  <h2 style="margin-bottom:16px">Загрузить проект</h2>
+
+  <!-- Drag & Drop -->
+  <div class="card" id="dropZone" style="border:2px dashed var(--accent);text-align:center;padding:40px;cursor:pointer;transition:background .2s"
+    ondragover="event.preventDefault();this.style.background='rgba(88,166,255,0.1)'"
+    ondragleave="this.style.background=''"
+    ondrop="handleDrop(event)"
+    onclick="document.getElementById('fileInput').click()">
+    <div style="font-size:32px;margin-bottom:8px">📁</div>
+    <div style="font-size:16px;font-weight:600">Перетащи ZIP-архив сюда</div>
+    <div style="color:var(--muted);font-size:13px;margin-top:4px">или нажми чтобы выбрать файл</div>
+    <input type="file" id="fileInput" accept=".zip" style="display:none" onchange="handleFileSelect(this)">
   </div>
+
+  <!-- Progress -->
+  <div id="pipelineProgress" style="display:none">
+    <div class="card">
+      <div id="pipelineSteps"></div>
+      <div style="margin-top:12px;height:4px;background:var(--border);border-radius:2px;overflow:hidden">
+        <div id="pipelineBar" style="height:100%;background:var(--accent);width:0%;transition:width .5s"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Result -->
   <div id="ingestResult"></div>
+
+  <!-- Manual path (collapsed) -->
+  <details style="margin-top:12px">
+    <summary style="color:var(--muted);cursor:pointer;font-size:12px">Ручной ввод пути (для продвинутых)</summary>
+    <div class="card" style="margin-top:8px">
+      <div class="row">
+        <input id="ingestDir" value="/app/test_data/cpp_project" placeholder="/app/test_data/cpp_project">
+        <button class="btn secondary" onclick="doManualPipeline()" style="flex:none">Run Pipeline</button>
+      </div>
+    </div>
+  </details>
 </div>
 
 <!-- Embeddings -->
@@ -302,17 +326,117 @@ async function loadDashboard() {
 }
 
 // Ingest
-async function doIngest() {
-  const dir = document.getElementById('ingestDir').value;
-  document.getElementById('ingestResult').innerHTML = '<p style="color:var(--muted)">Loading...</p>';
-  const data = await api('POST', '/ingest', { directory: dir });
-  document.getElementById('ingestResult').innerHTML = renderCard(`
-    <h3 style="color:${data.success ? 'var(--green)' : 'var(--red)'}">${data.success ? 'Success' : 'Errors'}</h3>
-    <p>Files: ${data.files_processed} | Nodes: ${data.nodes_created} | Edges: ${data.edges_created}</p>
-    ${data.errors.length ? '<pre style="color:var(--red)">' + data.errors.join('\n') + '</pre>' : ''}
-  `);
-  loadDashboard();
+// File upload & auto-pipeline
+function handleDrop(e) {
+  e.preventDefault();
+  e.target.closest('#dropZone').style.background = '';
+  const file = e.dataTransfer.files[0];
+  if (file) uploadAndProcess(file);
 }
+function handleFileSelect(input) {
+  if (input.files[0]) uploadAndProcess(input.files[0]);
+}
+
+async function uploadAndProcess(file) {
+  const progress = document.getElementById('pipelineProgress');
+  const steps = document.getElementById('pipelineSteps');
+  const bar = document.getElementById('pipelineBar');
+  const result = document.getElementById('ingestResult');
+
+  progress.style.display = 'block';
+  result.innerHTML = '';
+  bar.style.width = '0%';
+
+  const stepNames = ['Uploading', 'Scanning & filtering', 'Converting TXT to MD', 'Parsing code & docs', 'Generating embeddings', 'Generating summaries'];
+
+  function setStep(idx, status) {
+    let html = '';
+    for (let i = 0; i < stepNames.length; i++) {
+      const icon = i < idx ? '<span style="color:var(--green)">done</span>' :
+                   i === idx ? (status === 'error' ? '<span style="color:var(--red)">error</span>' : '<span style="color:var(--accent)">...</span>') :
+                   '<span style="color:var(--muted)">-</span>';
+      const color = i < idx ? 'var(--green)' : i === idx ? 'var(--text)' : 'var(--muted)';
+      html += '<div style="padding:4px 0;color:' + color + '">' + icon + ' ' + stepNames[i] + '</div>';
+    }
+    steps.innerHTML = html;
+    bar.style.width = Math.round((idx / stepNames.length) * 100) + '%';
+  }
+
+  try {
+    // Step 1: Upload
+    setStep(0);
+    const formData = new FormData();
+    formData.append('file', file);
+    const uploadRes = await fetch(API + '/upload', { method: 'POST', body: formData });
+    const uploadData = await uploadRes.json();
+    if (!uploadRes.ok) throw new Error(uploadData.detail || 'Upload failed');
+
+    // Steps 2-5: Auto-pipeline
+    setStep(1);
+    const pipeRes = await fetch(API + '/pipeline', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_name: uploadData.project_name })
+    });
+    const pipeData = await pipeRes.json();
+    if (!pipeRes.ok) throw new Error(pipeData.detail || 'Pipeline failed');
+
+    setStep(6); // All done
+    bar.style.width = '100%';
+
+    result.innerHTML = renderCard(`
+      <h3 style="color:var(--green)">Project loaded successfully</h3>
+      <div class="stats-grid" style="margin-top:12px">
+        <div class="stat-card"><div class="num">${pipeData.total_files}</div><div class="label">Files</div></div>
+        <div class="stat-card"><div class="num">${pipeData.total_nodes}</div><div class="label">Nodes</div></div>
+        <div class="stat-card"><div class="num">${pipeData.total_edges}</div><div class="label">Edges</div></div>
+      </div>
+      ${pipeData.steps ? '<pre style="margin-top:12px;font-size:11px">' + JSON.stringify(pipeData.steps, null, 2) + '</pre>' : ''}
+      ${pipeData.errors && pipeData.errors.length ? '<pre style="color:var(--red);margin-top:8px">' + pipeData.errors.join('\\n') + '</pre>' : ''}
+    `);
+    loadDashboard();
+  } catch (err) {
+    setStep(0, 'error');
+    result.innerHTML = renderCard('<h3 style="color:var(--red)">Error</h3><pre>' + escHtml(err.message) + '</pre>');
+  }
+}
+
+async function doManualPipeline() {
+  const dir = document.getElementById('ingestDir').value;
+  const result = document.getElementById('ingestResult');
+  const progress = document.getElementById('pipelineProgress');
+  const steps = document.getElementById('pipelineSteps');
+  const bar = document.getElementById('pipelineBar');
+
+  progress.style.display = 'block';
+  result.innerHTML = '';
+  steps.innerHTML = '<div style="color:var(--accent)">Running pipeline...</div>';
+  bar.style.width = '20%';
+
+  try {
+    const res = await fetch(API + '/pipeline', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ directory: dir })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Failed');
+
+    bar.style.width = '100%';
+    steps.innerHTML = '<div style="color:var(--green)">All steps completed</div>';
+    result.innerHTML = renderCard(`
+      <h3 style="color:var(--green)">Done</h3>
+      <p>Files: ${data.total_files} | Nodes: ${data.total_nodes} | Edges: ${data.total_edges}</p>
+      <pre style="font-size:11px">${JSON.stringify(data.steps, null, 2)}</pre>
+    `);
+    loadDashboard();
+  } catch (err) {
+    bar.style.width = '0%';
+    result.innerHTML = renderCard('<p style="color:var(--red)">' + escHtml(err.message) + '</p>');
+  }
+}
+
+async function doIngest() { doManualPipeline(); }
 
 // Embeddings
 async function doEmbeddings() {
