@@ -1,36 +1,32 @@
 """
-Agentic GraphRAG - API Routes
-FastAPI эндпоинты для взаимодействия с LLM-агентом
+Tree Base - API Routes
+Universal knowledge graph with graph navigation.
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Query, UploadFile, File
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import logging
 import os
 import zipfile
-import tempfile
-import shutil
-import asyncio
 import hashlib
+import json
 
-from ..graph.models import GraphNode, GraphEdge, SubgraphResult, IngestResult, VirtualPatch
+from ..graph.models import GraphNode, GraphEdge, IngestResult
 from ..graph.storage import Neo4jStorage
 from ..parser.txt_converter import scan_and_filter
-from ..llm.embeddings import VectorStore, get_embedding, get_embeddings_batch
-from ..llm.entity_extractor import extract_all_files, merge_file_states, KnowledgeGraphState
+from ..llm.embeddings import VectorStore, get_embeddings_batch
+from ..llm.entity_extractor import extract_all_files, merge_file_states
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["graph"])
 
-# Storage instance — устанавливается из main.py через set_storage()
 _storage: Optional[Neo4jStorage] = None
+_vector_store: Optional[VectorStore] = None
 
 
 def set_storage(s: Neo4jStorage):
-    """Вызывается из main.py при старте приложения"""
     global _storage
     _storage = s
 
@@ -39,10 +35,6 @@ def get_storage() -> Neo4jStorage:
     if _storage is None or _storage._driver is None:
         raise HTTPException(status_code=503, detail="Neo4j not connected")
     return _storage
-
-
-# Vector store instance
-_vector_store: Optional[VectorStore] = None
 
 
 def set_vector_store(vs: VectorStore):
@@ -56,97 +48,9 @@ def get_vector_store() -> VectorStore:
     return _vector_store
 
 
-# ============== Request/Response Models ==============
-
-class IngestRequest(BaseModel):
-    """Запрос на индексацию файлов"""
-    directory: str = Field(..., description="Путь к директории для индексации")
-    extensions: List[str] = Field(default=[".cpp", ".h", ".hpp", ".cc"], description="Расширения файлов")
-    recursive: bool = Field(default=True, description="Рекурсивный обход")
-
-
-class NodeResponse(BaseModel):
-    """Ответ с данными узла"""
-    node_id: str
-    type: str
-    name: str
-    signature: str
-    file_path: str
-    line_start: int
-    line_end: int
-    summary: str
-    tags: List[str]
-    source_code: Optional[str] = None
-
-
-class SubgraphRequest(BaseModel):
-    """Запрос подграфа"""
-    start_node_id: str
-    depth: int = Field(default=2, ge=1, le=3)
-    edge_types: Optional[List[str]] = None
-    virtual_patches: Optional[List[Dict[str, str]]] = None  # Shadow Graph (Фаза B)
-
-
-class SubgraphResponse(BaseModel):
-    """Ответ с подграфом"""
-    center_node: Dict[str, Any]
-    nodes: List[Dict[str, Any]]
-    edges: List[Dict[str, Any]]
-    depth: int
-    total_nodes: int
-    total_edges: int
-
-
-class CodeResponse(BaseModel):
-    """Ответ с исходным кодом"""
-    node_id: str
-    source_code: str
-    file_path: str
-    line_start: int
-    line_end: int
-
-
-class SearchRequest(BaseModel):
-    """Запрос поиска"""
-    query: Optional[str] = None
-    node_type: Optional[str] = None
-    tags: Optional[List[str]] = None
-    limit: int = Field(default=50, ge=1, le=100)
-
-
-class VectorSearchRequest(BaseModel):
-    """Запрос векторного поиска (входная точка для агента)"""
-    query: str = Field(..., description="Текстовый промпт для поиска")
-    node_type: Optional[str] = Field(None, description="Фильтр по типу узла")
-    limit: int = Field(default=5, ge=1, le=20)
-
-
-class ScratchpadEntry(BaseModel):
-    """Запись в Scratchpad агента"""
-    session_id: str = Field(..., description="ID сессии агента")
-    content: str = Field(..., description="Текст записи (план, заметки)")
-    node_ids: List[str] = Field(default=[], description="Привязанные node_id")
-
-
-class VirtualPatchRequest(BaseModel):
-    """Запрос на создание виртуального патча"""
-    session_id: str
-    node_id: str
-    file_path: str
-    old_code: str
-    new_code: str
-
-
-class StatsResponse(BaseModel):
-    """Статистика графа"""
-    total_nodes: int
-    total_edges: int
-    node_types: List[str]
-    type_count: int
-
+# ============== Models ==============
 
 class HealthResponse(BaseModel):
-    """Health check"""
     status: str
     neo4j_connected: bool
     llm_provider: str
@@ -155,20 +59,35 @@ class HealthResponse(BaseModel):
     version: str
 
 
-class LLMTestRequest(BaseModel):
-    """Запрос тестирования LLM"""
-    prompt: str = Field(..., description="Промпт для LLM")
-    system: str = Field(default="", description="Системный промпт")
+class StatsResponse(BaseModel):
+    total_nodes: int
+    total_edges: int
+    node_types: List[str]
+    type_count: int
 
 
-# ============== API Endpoints ==============
+class SearchRequest(BaseModel):
+    query: Optional[str] = None
+    node_type: Optional[str] = None
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+class PipelineRequest(BaseModel):
+    directory: Optional[str] = None
+    project_name: Optional[str] = None
+
+
+class AgentQueryRequest(BaseModel):
+    question: str = Field(..., description="Question to ask the knowledge graph")
+    max_depth: int = Field(default=3, description="Max navigation depth")
+
+
+# ============== Health & Stats ==============
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check - проверка статуса системы"""
     from ..config import get_settings
     settings = get_settings()
-
     neo4j_ok = False
     if _storage and _storage._driver:
         try:
@@ -176,219 +95,71 @@ async def health_check():
             neo4j_ok = True
         except Exception:
             pass
-
     return HealthResponse(
         status="healthy" if neo4j_ok else "degraded",
         neo4j_connected=neo4j_ok,
         llm_provider=settings.llm_provider,
         llm_model=settings.llm_model,
         llm_configured=bool(settings.llm_api_key),
-        version="0.1.0"
+        version="2.0.0"
     )
-
-
-@router.post("/llm/test")
-async def test_llm(request: LLMTestRequest):
-    """Тест LLM — отправляет промпт и возвращает ответ модели"""
-    from ..llm.client import get_llm_client
-    client = get_llm_client()
-
-    if not client.api_key:
-        raise HTTPException(status_code=503, detail="LLM API key not configured")
-
-    try:
-        response = await client.generate(request.prompt, request.system)
-        return {
-            "provider": client.provider,
-            "model": client.model,
-            "response": response,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
-
-
-@router.post("/ingest")
-async def ingest_directory(request: IngestRequest):
-    """Legacy endpoint — redirects to /pipeline."""
-    from fastapi.responses import RedirectResponse
-    return {"message": "Use POST /api/v1/pipeline instead", "redirect": "/api/v1/pipeline"}
-
-
-@router.get("/subgraph/{node_id}", response_model=SubgraphResponse)
-async def get_subgraph(
-    node_id: str,
-    depth: int = Query(default=2, ge=1, le=3),
-    edge_types: Optional[str] = Query(default=None, description="Comma-separated edge types"),
-    include_code: bool = Query(default=False, description="Include source code")
-):
-    """
-    Получение подграфа вокруг узла.
-    
-    ВАЖНО: source_code НЕ включается по умолчанию.
-    Это экономит токены LLM при навигации.
-    Для получения кода используйте /node/{node_id}/code
-    """
-    s = get_storage()
-    
-    # Парсинг типов ребер
-    edge_filter = None
-    if edge_types:
-        edge_filter = [t.strip() for t in edge_types.split(",")]
-    
-    subgraph = s.get_subgraph(node_id, depth, edge_filter, include_code)
-    
-    if not subgraph:
-        raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
-    
-    return subgraph.to_dict(include_code)
-
-
-@router.get("/node/{node_id}", response_model=NodeResponse)
-async def get_node(node_id: str):
-    """Получение метаданных узла (без source_code)"""
-    s = get_storage()
-    node = s.get_node(node_id)
-    
-    if not node:
-        raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
-    
-    return NodeResponse(**node.to_api_dict(include_code=False))
-
-
-@router.get("/node/{node_id}/code", response_model=CodeResponse)
-async def get_node_code(node_id: str):
-    """
-    Получение полного исходного кода узла.
-    
-    Агент вызывает этот эндпоинт ТОЛЬКО когда принял решение
-    редактировать конкретный узел.
-    """
-    s = get_storage()
-    node = s.get_node(node_id)
-    
-    if not node:
-        raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
-    
-    return CodeResponse(
-        node_id=node.node_id,
-        source_code=node.source_code,
-        file_path=node.file_path,
-        line_start=node.line_start,
-        line_end=node.line_end
-    )
-
-
-@router.post("/search", response_model=List[NodeResponse])
-async def search_nodes(request: SearchRequest):
-    """
-    Поиск узлов по тексту или фильтрам.
-    
-    Используется как fallback если векторный поиск (Milvus/Qdrant) недоступен.
-    """
-    s = get_storage()
-    nodes = s.search_nodes(
-        query=request.query,
-        node_type=request.node_type,
-        tags=request.tags,
-        limit=request.limit
-    )
-    
-    return [NodeResponse(**n.to_api_dict(include_code=False)) for n in nodes]
 
 
 @router.get("/stats", response_model=StatsResponse)
 async def get_stats():
-    """Получение статистики графа"""
     s = get_storage()
-    stats = s.get_stats()
-    return StatsResponse(**stats)
+    return StatsResponse(**s.get_stats())
 
 
 @router.delete("/clear")
 async def clear_graph():
-    """Очистка всего графа и векторного хранилища (для тестирования)"""
     s = get_storage()
     s.clear_all()
     if _vector_store:
         _vector_store.delete_all()
-    _virtual_patches.clear()
-    _scratchpads.clear()
-    return {"message": "Graph, vectors, patches and scratchpads cleared"}
+    return {"message": "Graph cleared"}
 
 
-@router.get("/types")
-async def get_node_types():
-    """Получение списка допустимых типов узлов"""
-    from ..graph.models import NodeType
-    return [t.value for t in NodeType]
+# ============== Graph Navigation ==============
+
+@router.get("/node/{node_id}")
+async def get_node(node_id: str):
+    s = get_storage()
+    node = s.get_node(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
+    return node.to_api_dict(include_code=True)
 
 
-@router.get("/edge-types")
-async def get_edge_types():
-    """Получение списка допустимых типов ребер"""
-    from ..graph.models import EdgeType
-    return [t.value for t in EdgeType]
+@router.get("/subgraph/{node_id}")
+async def get_subgraph(
+    node_id: str,
+    depth: int = Query(default=2, ge=1, le=3),
+    edge_types: Optional[str] = Query(default=None),
+    include_code: bool = Query(default=False),
+):
+    s = get_storage()
+    edge_filter = [t.strip() for t in edge_types.split(",")] if edge_types else None
+    subgraph = s.get_subgraph(node_id, depth, edge_filter, include_code)
+    if not subgraph:
+        raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
+    return subgraph.to_dict(include_code)
 
 
-@router.get("/tags")
-async def get_allowed_tags():
-    """Получение списка допустимых тегов"""
-    from ..graph.models import TagEnum
-    return [t.value for t in TagEnum]
+@router.post("/search")
+async def search_nodes(request: SearchRequest):
+    s = get_storage()
+    nodes = s.search_nodes(query=request.query, node_type=request.node_type, limit=request.limit)
+    return [n.to_api_dict(include_code=False) for n in nodes]
 
 
-# ============== Upload & Auto-Pipeline ==============
+# ============== Upload & Pipeline ==============
 
 UPLOAD_DIR = "/app/uploads"
 
 
-@router.post("/upload")
-async def upload_project(file: UploadFile = File(...)):
-    """
-    Загрузка проекта через браузер (ZIP-архив или отдельные файлы).
-    Распаковывает в /app/uploads/{project_name}/ внутри контейнера.
-    """
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-    # Определяем имя проекта
-    original = file.filename or "project"
-    project_name = os.path.splitext(original)[0]
-    project_dir = os.path.join(UPLOAD_DIR, project_name)
-
-    # Читаем файл
-    content = await file.read()
-
-    if original.endswith('.zip'):
-        # ZIP — распаковываем
-        os.makedirs(project_dir, exist_ok=True)
-        tmp = os.path.join(UPLOAD_DIR, original)
-        with open(tmp, 'wb') as f:
-            f.write(content)
-        with zipfile.ZipFile(tmp, 'r') as z:
-            z.extractall(project_dir)
-        os.remove(tmp)
-    else:
-        # Одиночный файл
-        os.makedirs(project_dir, exist_ok=True)
-        with open(os.path.join(project_dir, original), 'wb') as f:
-            f.write(content)
-
-    # Сканируем и фильтруем
-    scan = scan_and_filter(project_dir)
-
-    return {
-        "project_name": project_name,
-        "project_dir": project_dir,
-        "scan": scan["stats"],
-        "cpp_files": len(scan["cpp_files"]),
-        "doc_files": len(scan["doc_files"]),
-        "txt_files": len(scan["txt_files"]),
-        "other_text": len(scan.get("other_text", [])),
-    }
-
-
-def _split_into_chunks(text: str, max_size: int = 2000) -> List[str]:
-    """Split text into chunks ≤ max_size, breaking on paragraph boundaries."""
+def _split_into_chunks(text: str, max_size: int = 8000) -> List[str]:
+    """Split text into chunks <= max_size, breaking on paragraph boundaries."""
     if len(text) <= max_size:
         return [text]
 
@@ -397,7 +168,6 @@ def _split_into_chunks(text: str, max_size: int = 2000) -> List[str]:
     current = ""
 
     for para in paragraphs:
-        # If single paragraph exceeds max_size, split by newlines then by chars
         if len(para) > max_size:
             if current:
                 chunks.append(current)
@@ -407,7 +177,6 @@ def _split_into_chunks(text: str, max_size: int = 2000) -> List[str]:
                 if len(current) + len(line) + 1 > max_size:
                     if current:
                         chunks.append(current)
-                    # If single line exceeds max_size, hard split
                     while len(line) > max_size:
                         chunks.append(line[:max_size])
                         line = line[max_size:]
@@ -427,19 +196,36 @@ def _split_into_chunks(text: str, max_size: int = 2000) -> List[str]:
     return chunks if chunks else [text[:max_size]]
 
 
-class PipelineRequest(BaseModel):
-    directory: Optional[str] = None
-    project_name: Optional[str] = None
+@router.post("/upload")
+async def upload_project(file: UploadFile = File(...)):
+    """Upload file → auto-run pipeline."""
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    original = file.filename or "project"
+    project_name = os.path.splitext(original)[0]
+    project_dir = os.path.join(UPLOAD_DIR, project_name)
+
+    content = await file.read()
+    if original.endswith('.zip'):
+        os.makedirs(project_dir, exist_ok=True)
+        tmp = os.path.join(UPLOAD_DIR, original)
+        with open(tmp, 'wb') as f:
+            f.write(content)
+        with zipfile.ZipFile(tmp, 'r') as z:
+            z.extractall(project_dir)
+        os.remove(tmp)
+    else:
+        os.makedirs(project_dir, exist_ok=True)
+        with open(os.path.join(project_dir, original), 'wb') as f:
+            f.write(content)
+
+    request = PipelineRequest(directory=project_dir)
+    return await auto_pipeline(request)
 
 
 @router.post("/pipeline")
 async def auto_pipeline(request: PipelineRequest):
     """
-    Universal pipeline: scan → document nodes → entity extraction → embeddings.
-
-    4 clean steps. No AST parsers, no MD parsers.
-    Entity extraction is THE CORE — DeepSeek reads every document
-    and extracts entities, facts, topics, skills, preferences + edges.
+    Tree Base pipeline: scan → chunks → entity extraction → embeddings (optional).
     """
     from ..llm.client import get_llm_client
     import time as _time
@@ -448,40 +234,28 @@ async def auto_pipeline(request: PipelineRequest):
     pipeline_start = _time.time()
 
     directory = request.directory
-    project_name = request.project_name
-    if project_name:
-        directory = os.path.join(UPLOAD_DIR, project_name)
+    if request.project_name:
+        directory = os.path.join(UPLOAD_DIR, request.project_name)
     if not directory or not os.path.isdir(directory):
         raise HTTPException(status_code=400, detail=f"Directory not found: {directory}")
 
     s = get_storage()
-    vs = get_vector_store()
     client = get_llm_client()
     steps = []
     errors = []
 
-    # ================================================================
-    # STEP 1: Scan & Filter — find all text files
-    # ================================================================
+    # STEP 1: Scan
     step_start = _time.time()
     scan = scan_and_filter(directory)
-    all_files = scan["cpp_files"] + scan["doc_files"] + scan["txt_files"] + scan.get("other_text", [])
-    steps.append({
-        "step": "scan",
-        "time_s": round(_time.time() - step_start, 2),
-        "total_files": len(all_files),
-        "stats": scan["stats"],
-    })
-    logger.info(f"Step 1 (scan): {len(all_files)} files found")
+    all_files = scan["files"]
+    steps.append({"step": "scan", "time_s": round(_time.time() - step_start, 2), "files": len(all_files)})
+    logger.info(f"Step 1 (scan): {len(all_files)} files")
 
-    # ================================================================
-    # STEP 2: Create document chunks — each file split into ≤2000 char chunks
-    # Full content preserved, no truncation.
-    # ================================================================
+    # STEP 2: Create chunks
     step_start = _time.time()
     doc_nodes = []
     chunk_edges = []
-    CHUNK_SIZE = 2000
+    CHUNK_SIZE = 8000
 
     for fp in all_files:
         try:
@@ -489,37 +263,24 @@ async def auto_pipeline(request: PipelineRequest):
                 content = f.read()
             if len(content.strip()) < 10:
                 continue
-
-            rel_path = os.path.relpath(fp, directory) if directory else fp
+            rel_path = os.path.relpath(fp, directory)
             file_hash = hashlib.sha256(rel_path.encode()).hexdigest()[:16]
             name = os.path.basename(fp)
-
-            # Split into chunks on paragraph boundaries
             chunks = _split_into_chunks(content, CHUNK_SIZE)
 
-            prev_node_id = None
+            prev_id = None
             for ci, chunk_text in enumerate(chunks):
                 node_id = f"doc::{file_hash}::{ci}"
                 doc_nodes.append(GraphNode(
-                    node_id=node_id,
-                    type="document",
-                    name=f"{name}::chunk_{ci}",
-                    signature=rel_path,
-                    file_path=rel_path,
-                    line_start=0,
-                    line_end=0,
+                    node_id=node_id, type="document",
+                    name=f"{name}::chunk_{ci}", signature=rel_path,
+                    file_path=rel_path, line_start=0, line_end=0,
                     source_code=chunk_text,
-                    summary=f"{name} [{ci+1}/{len(chunks)}]",
-                    tags=[],
+                    summary=f"{name} [{ci+1}/{len(chunks)}]", tags=[],
                 ))
-                # NEXT_CHUNK edge for ordering
-                if prev_node_id:
-                    chunk_edges.append(GraphEdge(
-                        source_id=prev_node_id,
-                        target_id=node_id,
-                        edge_type="NEXT_CHUNK",
-                    ))
-                prev_node_id = node_id
+                if prev_id:
+                    chunk_edges.append(GraphEdge(source_id=prev_id, target_id=node_id, edge_type="NEXT_CHUNK"))
+                prev_id = node_id
         except Exception as e:
             errors.append(f"{fp}: {e}")
 
@@ -528,598 +289,259 @@ async def auto_pipeline(request: PipelineRequest):
     if chunk_edges:
         s.bulk_create_edges(chunk_edges)
 
-    steps.append({
-        "step": "create_chunks",
-        "time_s": round(_time.time() - step_start, 2),
-        "files": len(all_files),
-        "chunks_created": len(doc_nodes),
-        "chunk_edges": len(chunk_edges),
-        "errors": len(errors),
-    })
+    steps.append({"step": "chunks", "time_s": round(_time.time() - step_start, 2),
+                   "files": len(all_files), "chunks": len(doc_nodes)})
     logger.info(f"Step 2 (chunks): {len(all_files)} files → {len(doc_nodes)} chunks")
 
-    # ================================================================
-    # STEP 3: Entity Extraction — THE CORE
-    # Context-aware: sequential within file, parallel between files.
-    # Each chunk sees entities from previous chunks of the SAME file.
-    # LLM reuses existing entities, updates summaries, evolves edges.
-    # ================================================================
+    # STEP 3: Entity Extraction (context-aware)
     step_start = _time.time()
     entity_nodes = []
     entity_edges = []
 
     if client.api_key and doc_nodes:
-        # Group chunks by file (for sequential processing within each file)
         files_chunks: Dict[str, List[Dict[str, Any]]] = {}
         for node in doc_nodes:
             content = node.source_code or ""
             if len(content.strip()) < 20:
                 continue
-            file_path = node.file_path or "unknown"
-            if file_path not in files_chunks:
-                files_chunks[file_path] = []
-            files_chunks[file_path].append({
-                "node_id": node.node_id,
-                "content": content,
-            })
+            fp = node.file_path or "unknown"
+            if fp not in files_chunks:
+                files_chunks[fp] = []
+            files_chunks[fp].append({"node_id": node.node_id, "content": content})
 
         logger.info(f"Step 3 (extraction): {sum(len(c) for c in files_chunks.values())} chunks across {len(files_chunks)} files")
 
-        # Run extraction: sequential per file, parallel between files
-        file_states = await extract_all_files(
-            client, files_chunks, concurrency=10
-        )
-
-        # Merge all file states into one global state
+        file_states = await extract_all_files(client, files_chunks, concurrency=10)
         global_state = merge_file_states(file_states)
         logger.info(f"Extraction done: {len(global_state.entities)} entities, {len(global_state.edges)} edges")
 
-        # Convert EntityState → GraphNode (node_id by name, not type)
+        entity_node_ids = {}
         for name, ent in global_state.entities.items():
             node_id = f"entity::{name}"
+            entity_node_ids[name] = node_id
             entity_nodes.append(GraphNode(
-                node_id=node_id,
-                type=ent.type,
-                name=name,
-                signature="",
-                file_path="",
-                line_start=0,
-                line_end=0,
-                source_code="",
-                summary=ent.summary,
-                tags=[],
+                node_id=node_id, type=ent.type, name=name,
+                signature="", file_path="", line_start=0, line_end=0,
+                source_code="", summary=ent.summary, tags=[],
             ))
 
         if entity_nodes:
             s.bulk_create_nodes(entity_nodes)
 
-        # Create edges: document chunks → entities (MENTIONS)
-        entity_node_ids = {n.name: n.node_id for n in entity_nodes}
         for name, ent in global_state.entities.items():
-            ent_node_id = entity_node_ids.get(name)
-            if not ent_node_id:
+            ent_id = entity_node_ids.get(name)
+            if not ent_id:
                 continue
             for chunk_id in ent.source_chunks:
-                entity_edges.append(GraphEdge(
-                    source_id=chunk_id,
-                    target_id=ent_node_id,
-                    edge_type="MENTIONS",
-                    metadata={"confidence": ent.confidence},
-                ))
+                entity_edges.append(GraphEdge(source_id=chunk_id, target_id=ent_id,
+                                              edge_type="MENTIONS", metadata={"confidence": ent.confidence}))
 
-        # Create edges: entity → entity (semantic relationships)
         for ed in global_state.edges:
             src_id = entity_node_ids.get(ed.source)
             tgt_id = entity_node_ids.get(ed.target)
             if src_id and tgt_id:
-                entity_edges.append(GraphEdge(
-                    source_id=src_id,
-                    target_id=tgt_id,
-                    edge_type=ed.edge_type,
-                    metadata={"weight": ed.weight},
-                ))
+                entity_edges.append(GraphEdge(source_id=src_id, target_id=tgt_id,
+                                              edge_type=ed.edge_type, metadata={"weight": ed.weight}))
 
         if entity_edges:
             s.bulk_create_edges(entity_edges)
 
-    steps.append({
-        "step": "entity_extraction",
-        "time_s": round(_time.time() - step_start, 2),
-        "entity_nodes": len(entity_nodes),
-        "entity_edges": len(entity_edges),
-        "files_processed": len(files_chunks) if client.api_key and doc_nodes else 0,
-    })
+    steps.append({"step": "extraction", "time_s": round(_time.time() - step_start, 2),
+                   "entities": len(entity_nodes), "edges": len(entity_edges)})
     logger.info(f"Step 3 (extraction): {len(entity_nodes)} entities, {len(entity_edges)} edges")
 
-    # ================================================================
-    # STEP 4: Embeddings — vectorize ALL nodes (documents + entities)
-    # ================================================================
+    # STEP 4: Embeddings (optional)
     step_start = _time.time()
-    all_nodes = doc_nodes + entity_nodes
     emb_count = 0
+    all_nodes = doc_nodes + entity_nodes
+    try:
+        vs = get_vector_store()
+        if vs and all_nodes:
+            texts = [n.source_code if n.type == "document" and n.source_code
+                     else f"{n.type}: {n.name} - {n.summary}" for n in all_nodes]
+            embeddings = await get_embeddings_batch(texts)
+            items = [{"node_id": n.node_id, "embedding": e,
+                       "payload": {"type": n.type, "name": n.name, "summary": n.summary, "file_path": n.file_path}}
+                     for n, e in zip(all_nodes, embeddings) if e]
+            emb_count = vs.upsert_batch(items)
+    except Exception as e:
+        logger.warning(f"Embeddings skipped: {e}")
 
-    if all_nodes:
-        texts = [
-            n.source_code if n.type == "document" and n.source_code
-            else f"{n.type}: {n.name} - {n.summary}"
-            for n in all_nodes
-        ]
-        embeddings = await get_embeddings_batch(texts)
-        items = []
-        for node, emb in zip(all_nodes, embeddings):
-            if emb:
-                items.append({
-                    "node_id": node.node_id,
-                    "embedding": emb,
-                    "payload": {
-                        "type": node.type, "name": node.name,
-                        "summary": node.summary, "file_path": node.file_path,
-                    }
-                })
-        emb_count = vs.upsert_batch(items)
-
-    steps.append({
-        "step": "embeddings",
-        "time_s": round(_time.time() - step_start, 2),
-        "indexed": emb_count,
-    })
-    logger.info(f"Step 4 (embeddings): {emb_count} vectors indexed")
+    steps.append({"step": "embeddings", "time_s": round(_time.time() - step_start, 2),
+                   "indexed": emb_count, "optional": True})
 
     total_time = round(_time.time() - pipeline_start, 2)
     return {
-        "success": True,
-        "project_dir": directory,
-        "total_time_s": total_time,
-        "total_files": len(all_files),
-        "total_nodes": len(all_nodes),
-        "total_edges": len(entity_edges),
-        "steps": steps,
+        "success": True, "project_dir": directory, "total_time_s": total_time,
+        "total_files": len(all_files), "total_nodes": len(all_nodes),
+        "total_edges": len(entity_edges) + len(chunk_edges), "steps": steps,
         "errors": errors[:10],
     }
 
 
-# ============== Bulk Operations (N+1 fix) ==============
+# ============== Agent Query (Graph Navigation) ==============
 
-@router.post("/nodes/bulk")
-async def get_nodes_bulk(node_ids: List[str]):
-    """
-    Получение метаданных нескольких узлов за 1 запрос.
+NAVIGATE_PROMPT = """You are navigating a knowledge graph to find information.
 
-    Решение N+1 для навигации: агент запрашивает 50 узлов
-    одним вызовом вместо 50 отдельных GET /node/{id}.
-    """
+QUESTION: {question}
+
+AVAILABLE NODES:
+{nodes_list}
+
+Pick the most relevant nodes. Return ONLY valid JSON (no markdown):
+{{"selected": ["name1", "name2"], "reasoning": "why"}}
+
+Select up to 5. If none relevant: {{"selected": [], "reasoning": "none relevant"}}"""
+
+
+ANSWER_PROMPT = """You are a knowledge assistant with access to a universal knowledge graph.
+The graph contains entities from diverse sources (code, literature, recipes, finance, psychology, etc).
+
+Answer based ONLY on the provided context. If contradictions exist, explain both sides.
+If insufficient context, say so. Answer in the same language as the question.
+
+QUESTION: {question}
+
+CONTEXT:
+{context}
+
+RELATIONSHIPS:
+{edges}"""
+
+
+@router.post("/agent/query")
+async def agent_query(request: AgentQueryRequest):
+    """Graph navigation query: LLM navigates graph to find answers."""
+    import time as _time
+    start = _time.time()
+
     s = get_storage()
-    nodes = s.get_nodes_bulk(node_ids)
-    return [n.to_api_dict(include_code=False) for n in nodes]
-
-
-@router.post("/nodes/bulk/code")
-async def get_nodes_code_bulk(node_ids: List[str]):
-    """
-    Получение кода нескольких узлов за 1 запрос.
-    Для случаев когда агент уже решил что ему нужны конкретные файлы.
-    """
-    s = get_storage()
-    nodes = s.get_nodes_bulk(node_ids)
-    return [
-        {
-            "node_id": n.node_id,
-            "source_code": n.source_code,
-            "file_path": n.file_path,
-            "line_start": n.line_start,
-            "line_end": n.line_end,
-        }
-        for n in nodes
-    ]
-
-
-# ============== Phase C: Vector Search ==============
-
-@router.post("/search/vector")
-async def vector_search(request: VectorSearchRequest):
-    """
-    Векторный поиск — ВХОДНАЯ ТОЧКА для агента.
-
-    Агент отправляет текстовый промпт → получает стартовые node_id
-    для дальнейшей навигации по графу через get_subgraph.
-    """
-    vs = get_vector_store()
-
-    # Генерируем эмбеддинг запроса
-    query_embedding = await get_embedding(request.query)
-    if not query_embedding:
-        raise HTTPException(status_code=503, detail="Failed to generate embedding")
-
-    results = vs.search(
-        query_vector=query_embedding,
-        limit=request.limit,
-        node_type=request.node_type
-    )
-
-    return {
-        "query": request.query,
-        "results": results,
-        "count": len(results)
-    }
-
-
-@router.post("/index/embeddings")
-async def index_embeddings():
-    """
-    Генерирует эмбеддинги для ВСЕХ узлов графа и сохраняет в Qdrant.
-    Обрабатывает порциями по 500 узлов чтобы не переполнить RAM.
-    """
-    s = get_storage()
-    vs = get_vector_store()
-
-    # Считаем общее кол-во узлов
-    total_in_graph = s.count_nodes()
-    if total_in_graph == 0:
-        return {"indexed": 0, "message": "No nodes in graph"}
-
-    total_indexed = 0
-    chunk_size = 500
-    offset = 0
-
-    while offset < total_in_graph:
-        # Забираем порцию узлов
-        nodes_chunk = s.search_nodes(limit=chunk_size, skip=offset)
-        if not nodes_chunk:
-            break
-
-        # Формируем текст для эмбеддинга — документы по содержимому, остальное по метаданным
-        texts = []
-        for node in nodes_chunk:
-            if node.type == "document" and node.source_code:
-                texts.append(node.source_code[:500])
-            else:
-                text = f"{node.type}: {node.name}"
-                if node.summary:
-                    text += f" - {node.summary}"
-                texts.append(text)
-
-        # Батч-генерация эмбеддингов через Gemini
-        embeddings = await get_embeddings_batch(texts)
-
-        # Сохраняем в Qdrant
-        items = []
-        for node, emb in zip(nodes_chunk, embeddings):
-            if emb is None:
-                continue
-            items.append({
-                "node_id": node.node_id,
-                "embedding": emb,
-                "payload": {
-                    "type": node.type,
-                    "name": node.name,
-                    "summary": node.summary,
-                    "file_path": node.file_path,
-                }
-            })
-
-        count = vs.upsert_batch(items)
-        total_indexed += count
-        offset += len(nodes_chunk)
-        logger.info(f"Embeddings: {total_indexed}/{total_in_graph} indexed")
-
-    return {"indexed": total_indexed, "total_nodes": total_in_graph}
-
-
-# ============== Phase C: LLM Summary Generation ==============
-
-@router.post("/generate/summaries")
-async def generate_summaries():
-    """
-    Батч-генерация summary для всех узлов через LLM.
-
-    Решение N+1: вместо 1 API-вызова на узел отправляем
-    пачки по 30 узлов за 1 вызов. 100K узлов = ~3.3K вызовов
-    вместо 100K (30x экономия токенов и времени).
-    """
     from ..llm.client import get_llm_client
-    s = get_storage()
     client = get_llm_client()
 
     if not client.api_key:
         raise HTTPException(status_code=503, detail="LLM not configured")
 
-    all_nodes = s.search_nodes(limit=100000)
+    navigation_steps = []
+    found_entities = []
+    total_nav_tokens = 0
 
-    # Фильтруем: только узлы без осмысленного summary и с кодом
-    needs_summary = [
-        n for n in all_nodes
-        if n.source_code
-        and (not n.summary or n.summary.startswith(("Class ", "Function ", "Document")))
-    ]
+    # Step 1: Direct name search
+    words = request.question.lower().split()
+    for word in words:
+        if len(word) > 2:
+            matches = s.search_entities_by_name(word, limit=5)
+            found_entities.extend(matches)
 
-    if not needs_summary:
-        return {"updated": 0, "total_nodes": len(all_nodes), "api_calls": 0}
+    if found_entities:
+        seen = set()
+        unique = []
+        for r in found_entities:
+            if r["node_id"] not in seen:
+                seen.add(r["node_id"])
+                unique.append(r)
+        found_entities = unique[:10]
+        navigation_steps.append({"step": "direct_search", "found": len(found_entities)})
 
-    # Батч-генерация: 30 узлов за 1 LLM-вызов
-    summaries = await client.batch_summarize(needs_summary, batch_size=30)
+    # Step 2: LLM navigation if direct search found nothing
+    if not found_entities:
+        roots = s.get_root_categories(limit=50)
+        if not roots:
+            raise HTTPException(status_code=404, detail="Knowledge graph is empty")
 
-    # Запись в Neo4j
-    updated = 0
-    for node in needs_summary:
-        if node.node_id in summaries:
-            node.summary = summaries[node.node_id]
-            s.update_node(node)
-            updated += 1
+        nodes_list = "\n".join([f"- {r['name']} [{r['type']}]: {r.get('summary', '')}" for r in roots])
+        nav_prompt = NAVIGATE_PROMPT.format(question=request.question, nodes_list=nodes_list)
+        nav_result = await client.generate_with_metrics(nav_prompt)
+        total_nav_tokens += nav_result.get("total_tokens", 0)
 
-    import math
-    api_calls = math.ceil(len(needs_summary) / 30)
+        nav_data = _parse_nav(nav_result["text"])
+        navigation_steps.append({"step": "root_nav", "options": len(roots), "selected": nav_data.get("selected", [])})
 
-    return {
-        "updated": updated,
-        "total_nodes": len(all_nodes),
-        "api_calls": api_calls,
-        "savings": f"{len(needs_summary)} nodes in {api_calls} calls instead of {len(needs_summary)}"
-    }
+        for name in nav_data.get("selected", [])[:3]:
+            matches = [r for r in roots if r["name"].lower() == name.lower()]
+            if not matches:
+                matches = s.search_entities_by_name(name, limit=1)
+            if not matches:
+                continue
 
+            children = s.get_children(matches[0]["node_id"], limit=30)
+            if children:
+                cl = "\n".join([f"- {c['name']} [{c['type']}]: {c.get('summary', '')}" for c in children])
+                nav2 = await client.generate_with_metrics(NAVIGATE_PROMPT.format(question=request.question, nodes_list=cl))
+                total_nav_tokens += nav2.get("total_tokens", 0)
+                nav2_data = _parse_nav(nav2["text"])
+                for cn in nav2_data.get("selected", [])[:5]:
+                    cm = [c for c in children if c["name"].lower() == cn.lower()]
+                    if cm:
+                        found_entities.append(cm[0])
+            else:
+                found_entities.append(matches[0])
 
-# ============== Phase C: Shadow Graph (Virtual Patches) ==============
+    if not found_entities:
+        raise HTTPException(status_code=404, detail="No relevant information found")
 
-# In-memory хранилище патчей (per-session)
-_virtual_patches: Dict[str, List[Dict[str, Any]]] = {}
-
-
-@router.post("/patches")
-async def create_patch(request: VirtualPatchRequest):
-    """Сохранение виртуального патча (незакоммиченное изменение)"""
-    from ..graph.models import VirtualPatch
-
-    patch = VirtualPatch(
-        node_id=request.node_id,
-        file_path=request.file_path,
-        old_code=request.old_code,
-        new_code=request.new_code,
-        session_id=request.session_id,
-    )
-
-    if request.session_id not in _virtual_patches:
-        _virtual_patches[request.session_id] = []
-    _virtual_patches[request.session_id].append(patch.to_dict())
-
-    return {"status": "stored", "session_id": request.session_id,
-            "patches_count": len(_virtual_patches[request.session_id])}
-
-
-@router.get("/patches/{session_id}")
-async def get_patches(session_id: str):
-    """Получение всех патчей сессии"""
-    patches = _virtual_patches.get(session_id, [])
-    return {"session_id": session_id, "patches": patches}
-
-
-@router.delete("/patches/{session_id}")
-async def clear_patches(session_id: str):
-    """Удаление патчей сессии (после коммита)"""
-    removed = len(_virtual_patches.pop(session_id, []))
-    return {"session_id": session_id, "removed": removed}
-
-
-@router.get("/node/{node_id}/code/shadow")
-async def get_node_code_with_patches(node_id: str, session_id: str = Query(...)):
-    """
-    Получение кода узла С НАЛОЖЕННЫМИ виртуальными патчами.
-
-    Агент видит актуальную версию кода, даже если изменения
-    ещё не записаны в основную БД.
-    """
-    s = get_storage()
-    node = s.get_node(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
-
-    code = node.source_code
-    patches = _virtual_patches.get(session_id, [])
-
-    # Применяем патчи для этого узла последовательно
-    for patch in patches:
-        if patch["node_id"] == node_id:
-            code = code.replace(patch["old_code"], patch["new_code"])
-
-    return {
-        "node_id": node.node_id,
-        "source_code": code,
-        "file_path": node.file_path,
-        "patched": code != node.source_code,
-        "session_id": session_id,
-    }
-
-
-# ============== Phase C: Scratchpad ==============
-
-# In-memory scratchpad (per-session)
-_scratchpads: Dict[str, List[Dict[str, Any]]] = {}
-
-
-@router.post("/scratchpad")
-async def write_scratchpad(entry: ScratchpadEntry):
-    """
-    Запись в Scratchpad агента.
-
-    Агент использует внешний буфер вместо хранения
-    архитектуры в контекстном окне.
-    """
-    from datetime import datetime
-
-    record = {
-        "content": entry.content,
-        "node_ids": entry.node_ids,
-        "created_at": datetime.utcnow().isoformat(),
-    }
-
-    if entry.session_id not in _scratchpads:
-        _scratchpads[entry.session_id] = []
-    _scratchpads[entry.session_id].append(record)
-
-    return {
-        "session_id": entry.session_id,
-        "entry_index": len(_scratchpads[entry.session_id]) - 1,
-        "status": "stored",
-    }
-
-
-@router.get("/scratchpad/{session_id}")
-async def read_scratchpad(session_id: str):
-    """Чтение всего Scratchpad сессии"""
-    entries = _scratchpads.get(session_id, [])
-    return {
-        "session_id": session_id,
-        "entries": entries,
-        "count": len(entries),
-    }
-
-
-@router.delete("/scratchpad/{session_id}")
-async def clear_scratchpad(session_id: str):
-    """Очистка Scratchpad сессии"""
-    removed = len(_scratchpads.pop(session_id, []))
-    return {"session_id": session_id, "removed": removed}
-
-
-# ============== Agent Query (RAG) ==============
-
-class AgentQueryRequest(BaseModel):
-    question: str = Field(..., description="Вопрос к агенту")
-    top_k: int = Field(default=10, description="Кол-во узлов из vector search")
-    depth: int = Field(default=1, description="Глубина subgraph вокруг найденных узлов")
-
-
-@router.post("/agent/query")
-async def agent_query(request: AgentQueryRequest):
-    """
-    RAG-запрос: vector search → subgraph context → LLM answer.
-
-    Полный цикл GraphRAG с метриками:
-    1. Эмбеддинг вопроса → Qdrant vector search → top_k стартовых узлов
-    2. Для каждого узла — get_subgraph(depth) → контекст
-    3. Собираем промпт с контекстом → Gemini → ответ
-    4. Возвращаем ответ + метрики (токены, время, узлы)
-    """
-    import time
-    start = time.time()
-
-    s = get_storage()
-    vs = get_vector_store()
-    from ..llm.client import get_llm_client
-    client = get_llm_client()
-
-    if not client.api_key:
-        raise HTTPException(status_code=503, detail="LLM API key not configured")
-
-    # Step 1: Vector search
-    query_embedding = await get_embedding(request.question)
-    if not query_embedding:
-        raise HTTPException(status_code=503, detail="Failed to generate query embedding")
-
-    vector_results = vs.search(
-        query_vector=query_embedding,
-        limit=request.top_k,
-    )
-
-    if not vector_results:
-        raise HTTPException(status_code=404, detail="No relevant nodes found")
-
-    # Step 2: Expand context via subgraph
-    context_nodes = {}  # node_id -> node_info
-    context_edges = []
-
-    for vr in vector_results:
-        node_id = vr.get("node_id", "")
-        if not node_id:
-            continue
-        # Get the node itself
-        node = s.get_node(node_id)
-        if node:
-            context_nodes[node_id] = node
-        # Expand subgraph
-        subgraph = s.get_subgraph(node_id, depth=request.depth)
-        if subgraph:
-            for n in subgraph.nodes:
-                if n.node_id not in context_nodes:
-                    context_nodes[n.node_id] = n
-            context_edges.extend(subgraph.edges)
-
-    # Step 3: Build prompt with context
+    # Step 3: Gather context
     context_parts = []
-    for nid, node in context_nodes.items():
+    edge_parts = []
+
+    for ent in found_entities[:10]:
+        node = s.get_node(ent["node_id"])
+        if not node:
+            continue
         info = f"[{node.type}] {node.name}"
-        if node.signature:
-            info += f" | signature: {node.signature}"
         if node.summary:
-            info += f" | summary: {node.summary}"
-        if node.file_path:
-            info += f" | file: {node.file_path}"
-        # Include source code for small nodes (< 2000 chars)
-        if node.source_code and len(node.source_code) < 2000:
-            info += f"\n```\n{node.source_code}\n```"
+            info += f": {node.summary}"
         context_parts.append(info)
 
-    edge_parts = []
-    seen_edges = set()
-    for e in context_edges:
-        key = f"{e.source_id}->{e.target_id}:{e.edge_type}"
-        if key not in seen_edges:
-            seen_edges.add(key)
-            edge_parts.append(f"  {e.source_id} --[{e.edge_type}]--> {e.target_id}")
+        for rel in s.get_related(ent["node_id"], limit=15):
+            d = "→" if rel.get("outgoing") else "←"
+            edge_parts.append(f"  {node.name} {d}[{rel.get('edge_type', '?')}]{d} {rel['name']}")
+            if rel.get("summary"):
+                context_parts.append(f"[{rel['type']}] {rel['name']}: {rel['summary']}")
 
-    context_text = "\n\n".join(context_parts)
-    edges_text = "\n".join(edge_parts[:50])  # Limit edges
+        for chunk in s.get_chunks_for_entity(ent.get("name", ""), limit=3):
+            if chunk.get("content"):
+                context_parts.append(f"[source: {chunk.get('file_path', '?')}]\n{chunk['content']}")
 
-    system_prompt = (
-        "You are a knowledge assistant with access to a universal knowledge graph. "
-        "The graph contains entities, facts, topics, skills, preferences, and documents from diverse sources "
-        "(code, literature, conversations, recipes, finance, etc). "
-        "Answer questions based ONLY on the provided context. "
-        "If context contains contradictions, explain both sides with their sources. "
-        "If the context doesn't contain enough information, say so explicitly. "
-        "Answer in the same language as the question."
+    # Step 4: LLM answers
+    answer_prompt = ANSWER_PROMPT.format(
+        question=request.question,
+        context="\n\n".join(context_parts),
+        edges="\n".join(edge_parts[:30]),
     )
-
-    user_prompt = f"""QUESTION: {request.question}
-
-GRAPH CONTEXT ({len(context_nodes)} nodes, {len(seen_edges)} edges):
-
-{context_text}
-
-RELATIONSHIPS:
-{edges_text}
-
-Based on this context, provide a detailed answer to the question."""
-
-    context_chars = len(user_prompt)
-
-    # Step 4: Call LLM with metrics
-    result = await client.generate_with_metrics(user_prompt, system_prompt)
-
-    total_time = round(time.time() - start, 2)
+    result = await client.generate_with_metrics(answer_prompt)
 
     return {
         "question": request.question,
         "answer": result["text"],
         "metrics": {
-            "total_time_s": total_time,
+            "total_time_s": round(_time.time() - start, 2),
             "llm_time_s": result["time_s"],
             "input_tokens": result["input_tokens"],
             "output_tokens": result["output_tokens"],
-            "total_tokens": result["total_tokens"],
-            "context_nodes": len(context_nodes),
-            "context_edges": len(seen_edges),
-            "context_chars": context_chars,
-            "vector_results": len(vector_results),
+            "total_tokens": result["total_tokens"] + total_nav_tokens,
+            "nav_tokens": total_nav_tokens,
+            "context_entities": len(found_entities),
         },
-        "sources": [
-            {"node_id": nid, "type": n.type, "name": n.name, "file": n.file_path}
-            for nid, n in list(context_nodes.items())[:20]
-        ],
+        "navigation": navigation_steps,
+        "sources": [{"node_id": e["node_id"], "type": e["type"], "name": e["name"]} for e in found_entities[:10]],
     }
 
 
-# ============== Entity Extraction ==============
-
-@router.post("/extract/entities")
-async def extract_entities_from_graph():
-    """Legacy — use /pipeline instead. Entity extraction is now integrated into the pipeline."""
-    return {"message": "Entity extraction is now part of /pipeline. Use POST /api/v1/pipeline instead."}
+def _parse_nav(text: str) -> Dict[str, Any]:
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.startswith("```")]
+        text = "\n".join(lines)
+    try:
+        return json.loads(text)
+    except:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start:end+1])
+            except:
+                pass
+    return {"selected": [], "reasoning": "parse error"}

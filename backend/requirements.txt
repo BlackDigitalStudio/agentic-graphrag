@@ -1,4 +1,4 @@
-# Agentic GraphRAG - Python Dependencies
+# Tree Base - Dependencies
 
 # Web Framework
 fastapi>=0.115.0
@@ -10,20 +10,14 @@ python-multipart>=0.0.12
 # Graph Database (Neo4j)
 neo4j>=5.25.0
 
-# Vector Database (Qdrant) — Phase B
+# Vector Database (Qdrant) — optional fallback
 qdrant-client>=1.11.0
 
-# Embeddings (local, no API needed)
+# Embeddings (local multilingual)
 sentence-transformers>=3.0.0
 
-# AST Parsing
-tree-sitter>=0.23.0
-tree-sitter-cpp>=0.23.0
-
-# LLM Integration (Phase B)
+# LLM Integration
 aiohttp>=3.10.5
-tenacity>=9.0.0
 
 # Utilities
 python-dotenv>=1.0.1
-httpx>=0.27.2

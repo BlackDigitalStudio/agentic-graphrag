@@ -120,7 +120,16 @@ class LLMClient:
             contents.append({"role": "model", "parts": [{"text": "Understood."}]})
         contents.append({"role": "user", "parts": [{"text": prompt}]})
 
-        payload = {"contents": contents}
+        payload = {
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": 8192},
+            "safetySettings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ],
+        }
 
         session = await self._get_session()
         async with session.post(url, json=payload) as resp:
@@ -132,6 +141,18 @@ class LLMClient:
             try:
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
             except (KeyError, IndexError):
+                # Log why extraction failed
+                finish_reason = "unknown"
+                try:
+                    finish_reason = data["candidates"][0].get("finishReason", "unknown")
+                except (KeyError, IndexError):
+                    pass
+                block_reason = ""
+                try:
+                    block_reason = data.get("promptFeedback", {}).get("blockReason", "")
+                except:
+                    pass
+                logger.warning(f"Gemini empty: finishReason={finish_reason}, blockReason={block_reason}")
                 text = ""
 
             usage = data.get("usageMetadata", {})

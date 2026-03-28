@@ -64,8 +64,9 @@ RULES:
 - UPDATE summaries — if you learn something new about an existing entity, set action="update"
 - UPDATE edges — if a relationship changed (enemies became friends), set action="update" with new type
 - CREATE only genuinely new entities not in the existing list
+- BUILD HIERARCHY: create category nodes (e.g. "персонажи", "локации") and connect entities via BELONGS_TO edges
 - Summaries in the same language as source content
-- Maximum 15 entities + 20 edges per chunk
+- Extract ALL meaningful entities and edges (no artificial limit)
 - Skip confidence < 0.3
 """
 
@@ -100,6 +101,7 @@ Return ONLY valid JSON (no markdown):
 
 RULES:
 - Use most specific type: "character" not "entity", "ingredient" not "thing"
+- BUILD HIERARCHY: create category nodes (e.g. "персонажи", "локации") and connect entities via BELONGS_TO edges
 - Entity names: lowercase, canonical
 - Summaries in the same language as source content
 - Maximum 15 entities + 20 edges
@@ -235,14 +237,18 @@ async def _extract_chunk_with_context(
         try:
             response = await llm_client.generate(prompt)
             if not response:
+                logger.warning(f"Empty response for {chunk_id} (attempt {attempt+1}), prompt length={len(prompt)}")
+                if attempt < max_retries:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1, 2, 4 sec
                 continue
             data = _parse_json_response(response)
             if data:
                 return data
+            logger.warning(f"Unparseable response for {chunk_id} (attempt {attempt+1}): {response[:100]}")
         except Exception as e:
-            logger.warning(f"Extraction attempt {attempt+1} failed for {chunk_id}: {e}")
-            if attempt < max_retries:
-                await asyncio.sleep(1)
+            logger.warning(f"Extraction error for {chunk_id} (attempt {attempt+1}): {e}")
+        if attempt < max_retries:
+            await asyncio.sleep(2 ** attempt)
 
     logger.error(f"Extraction failed after {max_retries+1} attempts: {chunk_id}")
     return None
@@ -277,6 +283,9 @@ async def extract_file_sequential(
                 data.get("edges", []),
                 chunk_id,
             )
+
+        # Small delay between chunks to avoid rate limits
+        await asyncio.sleep(0.5)
 
         if (i + 1) % 10 == 0 or i == len(chunks) - 1:
             logger.info(

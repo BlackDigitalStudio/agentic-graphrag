@@ -412,6 +412,76 @@ class Neo4jStorage:
             result = session.run(cypher, **params)
             return [GraphNode.from_dict(dict(record["n"])) for record in result]
     
+    # ============== Graph Navigation (for LLM agent) ==============
+
+    def get_root_categories(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get top-level categories/topics — nodes with no incoming BELONGS_TO/PART_OF edges."""
+        cypher = """
+        MATCH (n:Node)
+        WHERE n.type <> 'document'
+        AND NOT EXISTS { MATCH (n)-[:EDGE {type: 'BELONGS_TO'}]->() }
+        AND NOT EXISTS { MATCH (n)<-[:EDGE {type: 'CONTAINS'}]-() }
+        AND NOT EXISTS { MATCH (n)<-[:EDGE {type: 'PART_OF'}]-() }
+        RETURN n.node_id as node_id, n.type as type, n.name as name, n.summary as summary
+        ORDER BY n.name
+        LIMIT $limit
+        """
+        with self._driver.session(database=self.database) as session:
+            result = session.run(cypher, limit=limit)
+            return [dict(r) for r in result]
+
+    def get_children(self, node_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get child nodes connected via CONTAINS, PART_OF, BELONGS_TO, HAS_METHOD, etc."""
+        cypher = """
+        MATCH (parent:Node {node_id: $node_id})-[:EDGE]->(child:Node)
+        RETURN child.node_id as node_id, child.type as type, child.name as name, child.summary as summary
+        ORDER BY child.name
+        LIMIT $limit
+        """
+        with self._driver.session(database=self.database) as session:
+            result = session.run(cypher, node_id=node_id, limit=limit)
+            return [dict(r) for r in result]
+
+    def get_related(self, node_id: str, limit: int = 30) -> List[Dict[str, Any]]:
+        """Get all directly connected nodes with edge info."""
+        cypher = """
+        MATCH (n:Node {node_id: $node_id})-[e:EDGE]-(other:Node)
+        RETURN other.node_id as node_id, other.type as type, other.name as name,
+               other.summary as summary, e.type as edge_type,
+               startNode(e).node_id = $node_id as outgoing
+        ORDER BY other.name
+        LIMIT $limit
+        """
+        with self._driver.session(database=self.database) as session:
+            result = session.run(cypher, node_id=node_id, limit=limit)
+            return [dict(r) for r in result]
+
+    def get_chunks_for_entity(self, entity_name: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Get document chunks that MENTION a given entity."""
+        cypher = """
+        MATCH (chunk:Node)-[e:EDGE {type: 'MENTIONS'}]->(entity:Node {name: $name})
+        WHERE chunk.type = 'document'
+        RETURN chunk.node_id as node_id, chunk.source_code as content,
+               chunk.file_path as file_path, chunk.name as name
+        LIMIT $limit
+        """
+        with self._driver.session(database=self.database) as session:
+            result = session.run(cypher, name=entity_name, limit=limit)
+            return [dict(r) for r in result]
+
+    def search_entities_by_name(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Search entities by name (case-insensitive contains)."""
+        cypher = """
+        MATCH (n:Node)
+        WHERE n.type <> 'document' AND toLower(n.name) CONTAINS toLower($query)
+        RETURN n.node_id as node_id, n.type as type, n.name as name, n.summary as summary
+        ORDER BY n.name
+        LIMIT $limit
+        """
+        with self._driver.session(database=self.database) as session:
+            result = session.run(cypher, query=query, limit=limit)
+            return [dict(r) for r in result]
+
     # ============== Statistics ==============
     
     def get_stats(self) -> Dict[str, Any]:

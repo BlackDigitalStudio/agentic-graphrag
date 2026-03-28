@@ -1,13 +1,10 @@
 """
 Agentic GraphRAG - Embeddings & Vector Search
-Генерация эмбеддингов через Gemini Embedding API + хранение в Qdrant.
-
-Один разум: Gemini для extraction + Gemini для embeddings = единое семантическое пространство.
+Local multilingual embeddings (paraphrase-multilingual-MiniLM-L12-v2) + Qdrant.
 """
 
 import logging
 import hashlib
-import aiohttp
 from typing import List, Optional, Dict, Any
 
 from qdrant_client import QdrantClient
@@ -20,15 +17,26 @@ from ..config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Gemini embedding-001 output dimension
-EMBEDDING_DIM = 768
+# paraphrase-multilingual-MiniLM-L12-v2: 384 dim, 50+ languages
+EMBEDDING_DIM = 384
+
+_model = None
+
+
+def _get_model():
+    """Lazy-load sentence-transformers model."""
+    global _model
+    if _model is None:
+        from sentence_transformers import SentenceTransformer
+        settings = get_settings()
+        model_name = settings.default_embedding_model
+        logger.info(f"Loading embedding model: {model_name}")
+        _model = SentenceTransformer(model_name)
+        logger.info(f"Embedding model loaded, dim={_model.get_sentence_embedding_dimension()}")
+    return _model
 
 
 class VectorStore:
-    """
-    Qdrant-обёртка для хранения и поиска эмбеддингов узлов графа.
-    """
-
     def __init__(self, url: str = None, collection: str = None):
         settings = get_settings()
         self.url = url or settings.qdrant_url
@@ -42,10 +50,7 @@ class VectorStore:
             if self.collection not in collections:
                 self.client.create_collection(
                     collection_name=self.collection,
-                    vectors_config=VectorParams(
-                        size=EMBEDDING_DIM,
-                        distance=Distance.COSINE
-                    )
+                    vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE)
                 )
                 logger.info(f"Created Qdrant collection: {self.collection} (dim={EMBEDDING_DIM})")
             else:
@@ -56,10 +61,7 @@ class VectorStore:
                     self.client.delete_collection(self.collection)
                     self.client.create_collection(
                         collection_name=self.collection,
-                        vectors_config=VectorParams(
-                            size=EMBEDDING_DIM,
-                            distance=Distance.COSINE
-                        )
+                        vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE)
                     )
                 else:
                     logger.info(f"Qdrant collection exists: {self.collection}")
@@ -75,12 +77,9 @@ class VectorStore:
         if not self.client:
             return False
         try:
-            point = PointStruct(
-                id=self._node_id_to_int(node_id),
-                vector=embedding,
-                payload={"node_id": node_id, **payload}
-            )
-            self.client.upsert(collection_name=self.collection, points=[point])
+            self.client.upsert(collection_name=self.collection, points=[
+                PointStruct(id=self._node_id_to_int(node_id), vector=embedding, payload={"node_id": node_id, **payload})
+            ])
             return True
         except Exception as e:
             logger.error(f"Qdrant upsert failed for {node_id}: {e}")
@@ -97,8 +96,7 @@ class VectorStore:
                     id=self._node_id_to_int(item["node_id"]),
                     vector=item["embedding"],
                     payload={"node_id": item["node_id"], **item["payload"]}
-                )
-                for item in chunk
+                ) for item in chunk
             ]
             try:
                 self.client.upsert(collection_name=self.collection, points=points)
@@ -112,15 +110,11 @@ class VectorStore:
             return []
         query_filter = None
         if node_type:
-            query_filter = Filter(
-                must=[FieldCondition(key="type", match=MatchValue(value=node_type))]
-            )
+            query_filter = Filter(must=[FieldCondition(key="type", match=MatchValue(value=node_type))])
         try:
             results = self.client.query_points(
-                collection_name=self.collection,
-                query=query_vector,
-                limit=limit,
-                query_filter=query_filter,
+                collection_name=self.collection, query=query_vector,
+                limit=limit, query_filter=query_filter,
             )
             return [{**hit.payload, "score": hit.score} for hit in results.points]
         except Exception as e:
@@ -140,85 +134,32 @@ class VectorStore:
 
 
 async def get_embedding(text: str, api_key: str = None) -> Optional[List[float]]:
-    """Gemini Embedding API — single text."""
-    settings = get_settings()
-    key = api_key or settings.llm_api_key
-    if not key:
+    """Local embedding via sentence-transformers."""
+    try:
+        model = _get_model()
+        embedding = model.encode(text[:2000], normalize_embeddings=True)
+        return embedding.tolist()
+    except Exception as e:
+        logger.error(f"Embedding failed: {e}")
         return None
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={key}"
-    payload = {"content": {"parts": [{"text": text[:2000]}]}}
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload) as resp:
-            if resp.status != 200:
-                error = await resp.text()
-                logger.error(f"Embedding API error {resp.status}: {error}")
-                return None
-            data = await resp.json()
-            try:
-                return data["embedding"]["values"]
-            except (KeyError, IndexError):
-                logger.error(f"Unexpected embedding response: {data}")
-                return None
 
 
 async def get_embeddings_batch(
     texts: List[str],
     api_key: str = None,
-    batch_size: int = 100,
+    batch_size: int = 256,
 ) -> List[Optional[List[float]]]:
-    """
-    Gemini batchEmbedContents API — up to 100 texts per call.
-    Same mind as Gemini 2.5 Flash extraction = aligned semantic space.
-    """
-    settings = get_settings()
-    key = api_key or settings.llm_api_key
-    if not key:
-        return [None] * len(texts)
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents?key={key}"
-    model = "models/gemini-embedding-001"
-
-    results: List[Optional[List[float]]] = []
-
-    async with aiohttp.ClientSession() as session:
+    """Batch local embeddings."""
+    if not texts:
+        return []
+    try:
+        model = _get_model()
+        results = []
         for i in range(0, len(texts), batch_size):
-            chunk = texts[i:i + batch_size]
-            payload = {
-                "requests": [
-                    {"content": {"parts": [{"text": t[:2000]}]}, "model": model}
-                    for t in chunk
-                ]
-            }
-            try:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status != 200:
-                        error = await resp.text()
-                        logger.error(f"Batch embedding error {resp.status}: {error}")
-                        results.extend([None] * len(chunk))
-                        continue
-                    data = await resp.json()
-                    for emb in data.get("embeddings", []):
-                        results.append(emb.get("values"))
-            except Exception as e:
-                logger.error(f"Batch embedding failed: {e}")
-                results.extend([None] * len(chunk))
-
-    return results
-
-
-# For entity resolution — local model (fast, no API calls for internal matching)
-_local_model = None
-
-
-def _get_model():
-    """Lazy-load local sentence-transformers for entity resolution only."""
-    global _local_model
-    if _local_model is None:
-        from sentence_transformers import SentenceTransformer
-        settings = get_settings()
-        model_name = settings.default_embedding_model
-        logger.info(f"Loading local embedding model for entity resolution: {model_name}")
-        _local_model = SentenceTransformer(model_name)
-    return _local_model
+            chunk = [t[:2000] for t in texts[i:i + batch_size]]
+            embeddings = model.encode(chunk, normalize_embeddings=True, show_progress_bar=False)
+            results.extend([e.tolist() for e in embeddings])
+        return results
+    except Exception as e:
+        logger.error(f"Batch embedding failed: {e}")
+        return [None] * len(texts)

@@ -1,4 +1,4 @@
-# Agentic GraphRAG - Docker Compose Configuration
+# Tree Base - Docker Compose Configuration
 # Neo4j + Qdrant for local development
 
 services:
@@ -50,9 +50,10 @@ services:
       - NEO4J_USER=neo4j
       - NEO4J_PASSWORD=password
       - QDRANT_URL=http://qdrant:6333
-      - LLM_PROVIDER=gemini
+      - LLM_PROVIDER=openai
       - LLM_API_KEY=${LLM_API_KEY:-}
-      - LLM_MODEL=gemini-2.5-flash
+      - LLM_MODEL=deepseek-chat
+      - LLM_BASE_URL=https://api.deepseek.com/v1/chat/completions
       - PYTHONUNBUFFERED=1
     depends_on:
       neo4j:
@@ -62,7 +63,7 @@ services:
     volumes:
       - ./backend:/app/backend
       - ./test_data:/app/test_data
-      - /c/Dev/ArcaneDepths:/app/ArcaneDepths:ro
+      - ${DATA_DIR:-./test_data}:/app/data:ro
     deploy:
       resources:
         limits:

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GraphRAG</title>
+<title>Tree Base</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--user-bg:#1c2d4a;--ai-bg:#1c1c2e;--green:#3fb950;--red:#f85149}
@@ -61,7 +61,7 @@ header .dot.off{background:var(--red)}
 <body>
 
 <header>
-  <h1>🧠 GraphRAG</h1>
+  <h1>🌳 Tree Base</h1>
   <div class="status">
     <span class="dot" id="statusDot"></span>
     <span id="statusText">connecting...</span>
@@ -107,7 +107,7 @@ header .dot.off{background:var(--red)}
 </div>
 
 <script>
-const API = '/api/v1';
+const API = window.location.origin + '/api/v1';
 const chat = document.getElementById('chat');
 const input = document.getElementById('input');
 
@@ -135,7 +135,7 @@ function addMsg(text, type, extra) {
     if (extra.metrics) {
       const m = document.createElement('div');
       m.className = 'metrics';
-      m.textContent = `⏱ ${extra.metrics.total_time_s}s | 🔢 ${extra.metrics.total_tokens} tok | 📊 ${extra.metrics.context_nodes} nodes`;
+      m.textContent = `⏱ ${extra.metrics.total_time_s}s | 🔢 ${extra.metrics.total_tokens} tok | 📊 ${extra.metrics.context_entities || extra.metrics.context_nodes || '?'} entities`;
       div.appendChild(m);
     }
   }
@@ -161,7 +161,7 @@ async function sendMessage() {
     const res = await fetch(`${API}/agent/query`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question: text, top_k: 10, depth: 1})
+      body: JSON.stringify({question: text, max_depth: 3})
     });
     typing.remove();
     if (!res.ok) {
@@ -180,15 +180,32 @@ async function sendMessage() {
 // Upload files
 async function uploadFiles(files) {
   for (const file of files) {
-    addMsg(`📎 Загружаю: ${file.name}`, 'system');
+    addMsg(`📎 Загружаю и обрабатываю: ${file.name}...`, 'system');
+    const bar = document.getElementById('pipelineBar');
+    const fill = document.getElementById('pipelineFill');
+    const pText = document.getElementById('pipelineText');
+    bar.classList.add('active');
+    pText.textContent = `Pipeline: ${file.name}...`;
+    fill.style.width = '10%';
+
     const form = new FormData();
     form.append('file', file);
     try {
       const res = await fetch(`${API}/upload`, {method: 'POST', body: form});
       const data = await res.json();
-      addMsg(`✅ ${file.name}: ${data.scan?.total_scanned || '?'} файлов найдено`, 'system');
+      fill.style.width = '100%';
+      if (data.success) {
+        pText.textContent = `Pipeline: готово (${data.total_nodes} узлов, ${data.total_edges} рёбер, ${data.total_time_s}s)`;
+        addMsg(`✅ ${file.name}: ${data.total_nodes} узлов, ${data.total_edges} рёбер за ${data.total_time_s}s. Можно задавать вопросы.`, 'system');
+      } else {
+        pText.textContent = 'Pipeline: ошибка';
+        addMsg(`❌ ${file.name}: ${JSON.stringify(data.errors?.slice(0,3))}`, 'system');
+      }
+      setTimeout(() => bar.classList.remove('active'), 5000);
     } catch(e) {
-      addMsg(`❌ Ошибка загрузки ${file.name}`, 'system');
+      fill.style.width = '0%';
+      pText.textContent = 'Pipeline: ошибка';
+      addMsg(`❌ Ошибка: ${e.message}`, 'system');
     }
   }
 }
