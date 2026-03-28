@@ -58,11 +58,9 @@ ALL_TEXT_EXTENSIONS = (
 # Мусорные паттерны — пропускаем целиком
 SKIP_DIRS = {
     '__pycache__', '.git', '.svn', '.hg', 'node_modules',
-    '.vs', '.vscode', '.idea', 'build', 'Build', 'cmake-build',
-    'Debug', 'Release', 'x64', 'x86', '.cache', 'out',
+    '.vs', '.vscode', '.idea',
+    'Debug', 'Release', 'x64', 'x86', '.cache',
     'bin', 'obj', 'dist', '.gradle', 'target',
-    # Toolchains — пропускаем для MVP, нагрузочный тест отдельно
-    'tools', 'external', 'mingw64', 'mingw32',
 }
 
 SKIP_FILES = {

@@ -3,8 +3,8 @@ Agentic GraphRAG - LLM Client
 Провайдер-агностичный клиент для работы с LLM.
 
 Поддерживаемые провайдеры:
+- openai (OpenAI-совместимые API: DeepSeek, GPT, Groq, Together)
 - gemini (Google Generative AI)
-- openai (OpenAI-совместимые API)
 - anthropic (Claude)
 
 Расширение: добавить новый провайдер = добавить метод _call_<provider>.
@@ -93,9 +93,10 @@ class LLMClient:
 
         if self.provider == "gemini":
             result = await self._call_gemini_with_metrics(prompt, system)
+        elif self.provider == "openai":
+            result = await self._call_openai_with_metrics(prompt, system)
         else:
             text = await self.generate(prompt, system)
-            # Rough estimation for non-Gemini providers
             result = {
                 "text": text,
                 "input_tokens": len(prompt) // 4,
@@ -146,8 +147,8 @@ class LLMClient:
         result = await self._call_gemini_with_metrics(prompt, system)
         return result["text"]
 
-    async def _call_openai(self, prompt: str, system: str = "") -> str:
-        """OpenAI-совместимый API (GPT, Groq, Together, etc.)"""
+    async def _call_openai_with_metrics(self, prompt: str, system: str = "") -> dict:
+        """OpenAI-совместимый API с метриками (DeepSeek, GPT, Groq, etc.)"""
         url = self.base_url or "https://api.openai.com/v1/chat/completions"
 
         messages = []
@@ -163,9 +164,21 @@ class LLMClient:
             if resp.status != 200:
                 error = await resp.text()
                 logger.error(f"OpenAI API error {resp.status}: {error}")
-                return ""
+                return {"text": "", "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
             data = await resp.json()
-            return data["choices"][0]["message"]["content"]
+            text = data["choices"][0]["message"]["content"]
+            usage = data.get("usage", {})
+            return {
+                "text": text,
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            }
+
+    async def _call_openai(self, prompt: str, system: str = "") -> str:
+        """OpenAI-совместимый API (DeepSeek, GPT, Groq, Together, etc.)"""
+        result = await self._call_openai_with_metrics(prompt, system)
+        return result["text"]
 
     async def _call_anthropic(self, prompt: str, system: str = "") -> str:
         """Anthropic Claude API"""

@@ -1,13 +1,13 @@
 """
 Agentic GraphRAG - Embeddings & Vector Search
-Генерация эмбеддингов через Gemini API + хранение в Qdrant.
+Генерация эмбеддингов через локальный sentence-transformers + хранение в Qdrant.
 
+Провайдер-агностик: не зависит от LLM-провайдера (DeepSeek/Gemini/OpenAI).
 Используется ТОЛЬКО как входная точка для агента:
 агент отправляет текстовый промпт → получает стартовый node_id.
 """
 
 import logging
-import aiohttp
 import hashlib
 from typing import List, Optional, Dict, Any
 
@@ -21,8 +21,24 @@ from ..config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Gemini embedding model output dimension
-EMBEDDING_DIM = 3072
+# sentence-transformers/all-MiniLM-L6-v2 → 384 dim
+EMBEDDING_DIM = 384
+
+# Lazy-loaded model (загружается один раз при первом вызове)
+_model = None
+
+
+def _get_model():
+    """Lazy-load sentence-transformers model"""
+    global _model
+    if _model is None:
+        from sentence_transformers import SentenceTransformer
+        settings = get_settings()
+        model_name = settings.default_embedding_model
+        logger.info(f"Loading embedding model: {model_name}")
+        _model = SentenceTransformer(model_name)
+        logger.info(f"Embedding model loaded, dim={_model.get_sentence_embedding_dimension()}")
+    return _model
 
 
 class VectorStore:
@@ -31,7 +47,7 @@ class VectorStore:
 
     Каждый узел хранится как точка в Qdrant:
     - id: числовой хеш от node_id
-    - vector: эмбеддинг от Gemini
+    - vector: эмбеддинг от sentence-transformers
     - payload: {node_id, type, name, summary}
     """
 
@@ -44,7 +60,6 @@ class VectorStore:
     def connect(self) -> bool:
         try:
             self.client = QdrantClient(url=self.url)
-            # Создаём коллекцию если нет
             collections = [c.name for c in self.client.get_collections().collections]
             if self.collection not in collections:
                 self.client.create_collection(
@@ -54,16 +69,32 @@ class VectorStore:
                         distance=Distance.COSINE
                     )
                 )
-                logger.info(f"Created Qdrant collection: {self.collection}")
+                logger.info(f"Created Qdrant collection: {self.collection} (dim={EMBEDDING_DIM})")
             else:
-                logger.info(f"Qdrant collection exists: {self.collection}")
+                # Проверяем размерность — если не совпадает, пересоздаём
+                info = self.client.get_collection(self.collection)
+                existing_dim = info.config.params.vectors.size
+                if existing_dim != EMBEDDING_DIM:
+                    logger.warning(
+                        f"Collection dim mismatch: {existing_dim} vs {EMBEDDING_DIM}, recreating"
+                    )
+                    self.client.delete_collection(self.collection)
+                    self.client.create_collection(
+                        collection_name=self.collection,
+                        vectors_config=VectorParams(
+                            size=EMBEDDING_DIM,
+                            distance=Distance.COSINE
+                        )
+                    )
+                    logger.info(f"Recreated Qdrant collection: {self.collection} (dim={EMBEDDING_DIM})")
+                else:
+                    logger.info(f"Qdrant collection exists: {self.collection}")
             return True
         except Exception as e:
             logger.error(f"Qdrant connection failed: {e}")
             return False
 
     def _node_id_to_int(self, node_id: str) -> int:
-        """Конвертация строкового node_id в числовой ID для Qdrant"""
         return int(hashlib.md5(node_id.encode()).hexdigest()[:15], 16)
 
     def upsert_node(
@@ -72,7 +103,6 @@ class VectorStore:
         embedding: List[float],
         payload: Dict[str, Any]
     ) -> bool:
-        """Сохранение эмбеддинга узла в Qdrant"""
         if not self.client:
             return False
         try:
@@ -95,9 +125,6 @@ class VectorStore:
         items: List[Dict[str, Any]],
         chunk_size: int = 200
     ) -> int:
-        """
-        Батч-вставка с чанкированием. Каждый item: {node_id, embedding, payload}
-        """
         if not self.client:
             return 0
         total = 0
@@ -126,12 +153,6 @@ class VectorStore:
         limit: int = 5,
         node_type: str = None
     ) -> List[Dict[str, Any]]:
-        """
-        Поиск ближайших узлов по вектору.
-
-        Returns:
-            [{node_id, type, name, summary, score}, ...]
-        """
         if not self.client:
             return []
 
@@ -160,7 +181,6 @@ class VectorStore:
             return []
 
     def delete_all(self):
-        """Очистка коллекции"""
         if self.client:
             try:
                 self.client.delete_collection(self.collection)
@@ -177,83 +197,39 @@ class VectorStore:
 
 async def get_embedding(text: str, api_key: str = None) -> Optional[List[float]]:
     """
-    Генерация эмбеддинга через Gemini Embedding API.
-
-    Модель: text-embedding-004 (768 dim, бесплатная)
+    Генерация эмбеддинга через локальный sentence-transformers.
+    Не требует API ключа — работает на CPU.
     """
-    settings = get_settings()
-    key = api_key or settings.llm_api_key
-    if not key:
+    try:
+        model = _get_model()
+        embedding = model.encode(text, normalize_embeddings=True)
+        return embedding.tolist()
+    except Exception as e:
+        logger.error(f"Embedding generation failed: {e}")
         return None
-
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-embedding-001:embedContent?key={key}"
-    )
-    payload = {
-        "content": {"parts": [{"text": text}]}
-    }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload) as resp:
-            if resp.status != 200:
-                error = await resp.text()
-                logger.error(f"Embedding API error {resp.status}: {error}")
-                return None
-            data = await resp.json()
-            try:
-                return data["embedding"]["values"]
-            except (KeyError, IndexError):
-                logger.error(f"Unexpected embedding response: {data}")
-                return None
 
 
 async def get_embeddings_batch(
     texts: List[str],
     api_key: str = None,
-    batch_size: int = 100,
+    batch_size: int = 256,
 ) -> List[Optional[List[float]]]:
     """
-    Батч-генерация эмбеддингов через Gemini batchEmbedContents API.
-
-    Решение N+1: вместо 1 HTTP-вызова на текст отправляем
-    пачки по batch_size (до 100) за 1 вызов.
-    100K узлов = ~1K вызовов вместо 100K (100x экономия).
+    Батч-генерация эмбеддингов через локальный sentence-transformers.
+    Работает на CPU, не требует API.
+    batch_size=256 — оптимально для RAM/CPU.
     """
-    settings = get_settings()
-    key = api_key or settings.llm_api_key
-    if not key:
-        return [None] * len(texts)
+    if not texts:
+        return []
 
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-embedding-001:batchEmbedContents?key={key}"
-    )
-    model = "models/gemini-embedding-001"
-
-    results: List[Optional[List[float]]] = []
-
-    async with aiohttp.ClientSession() as session:
+    try:
+        model = _get_model()
+        results = []
         for i in range(0, len(texts), batch_size):
             chunk = texts[i:i + batch_size]
-            payload = {
-                "requests": [
-                    {"content": {"parts": [{"text": t}]}, "model": model}
-                    for t in chunk
-                ]
-            }
-            try:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status != 200:
-                        error = await resp.text()
-                        logger.error(f"Batch embedding error {resp.status}: {error}")
-                        results.extend([None] * len(chunk))
-                        continue
-                    data = await resp.json()
-                    for emb in data.get("embeddings", []):
-                        results.append(emb.get("values"))
-            except Exception as e:
-                logger.error(f"Batch embedding failed: {e}")
-                results.extend([None] * len(chunk))
-
-    return results
+            embeddings = model.encode(chunk, normalize_embeddings=True, show_progress_bar=False)
+            results.extend([e.tolist() for e in embeddings])
+        return results
+    except Exception as e:
+        logger.error(f"Batch embedding failed: {e}")
+        return [None] * len(texts)

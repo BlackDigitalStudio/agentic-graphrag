@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-# Промпт для Gemini — универсальная экстракция
+# Промпт для LLM — универсальная экстракция
 EXTRACTION_PROMPT = """You are a knowledge graph entity extractor. Analyze the content below and extract structured entities.
 
 CONTENT TYPE: {content_type}

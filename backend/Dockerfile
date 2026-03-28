@@ -13,7 +13,9 @@ RUN apt-get update && apt-get install -y \
 
 # Копирование зависимостей
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# CPU-only torch (saves ~1.5GB vs CUDA version)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Копирование кода — backend/ как пакет внутри /app/
 COPY . ./backend/

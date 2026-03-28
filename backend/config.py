@@ -18,9 +18,10 @@ class Settings(BaseSettings):
 
     # LLM Configuration (провайдер-агностик)
     # Поддерживаемые провайдеры: "gemini", "openai", "anthropic"
-    llm_provider: str = "gemini"
+    llm_provider: str = "openai"
     llm_api_key: str = ""
-    llm_model: str = "gemini-2.5-flash"
+    llm_model: str = "deepseek-chat"
+    llm_base_url_default: str = "https://api.deepseek.com/v1/chat/completions"
     llm_base_url: Optional[str] = None  # Для кастомных endpoint'ов
 
     # Application Settings
