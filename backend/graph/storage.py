@@ -12,7 +12,7 @@ import logging
 from neo4j import GraphDatabase, Driver
 from neo4j.exceptions import ServiceUnavailable, ConstraintError
 
-from .models import GraphNode, GraphEdge, SubgraphResult, NodeType, EdgeType, validate_tags
+from .models import GraphNode, GraphEdge, SubgraphResult, validate_tags
 
 logger = logging.getLogger(__name__)
 

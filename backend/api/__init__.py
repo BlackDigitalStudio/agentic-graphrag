@@ -1,5 +1,5 @@
 """
-Agentic GraphRAG - API Module
+Tree Base - API Module
 """
 
 from .routes import router
