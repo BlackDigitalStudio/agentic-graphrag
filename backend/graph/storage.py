@@ -455,7 +455,7 @@ class Neo4jStorage:
         """Get top-level entities — those with many outgoing edges (hubs of the graph)."""
         cypher = """
         MATCH (n:Node)
-        WHERE n.type NOT IN ['document', 'cached_answer']
+        WHERE NOT n.type IN ['document', 'cached_answer']
         OPTIONAL MATCH (n)-[e:EDGE]->()
         WITH n, count(e) as out_edges
         ORDER BY out_edges DESC

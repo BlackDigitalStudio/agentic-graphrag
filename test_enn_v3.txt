@@ -1,0 +1,62 @@
+Q: Кто главный герой?
+A: HTTP Error 500: Internal Server Error
+Sources: []
+Thinking: []
+Tokens: 0 | Iterations: 0 | Time: 0.29s
+---
+Q: Что такое синергия?
+A: HTTP Error 500: Internal Server Error
+Sources: []
+Thinking: []
+Tokens: 0 | Iterations: 0 | Time: 0.03s
+---
+Q: Кто такой Байрон?
+A: HTTP Error 500: Internal Server Error
+Sources: []
+Thinking: []
+Tokens: 0 | Iterations: 0 | Time: 0.03s
+---
+Q: Кому принадлежит шахта?
+A: HTTP Error 500: Internal Server Error
+Sources: []
+Thinking: []
+Tokens: 0 | Iterations: 0 | Time: 0.03s
+---
+Q: Кто убил Мартина?
+A: HTTP Error 500: Internal Server Error
+Sources: []
+Thinking: []
+Tokens: 0 | Iterations: 0 | Time: 0.03s
+---
+Q: Какие способности есть у Кёна?
+A: HTTP Error 500: Internal Server Error
+Sources: []
+Thinking: []
+Tokens: 0 | Iterations: 0 | Time: 0.03s
+---
+Q: Кто такая Марта?
+A: HTTP Error 500: Internal Server Error
+Sources: []
+Thinking: []
+Tokens: 0 | Iterations: 0 | Time: 0.03s
+---
+Q: Где находится лечебница?
+A: HTTP Error 500: Internal Server Error
+Sources: []
+Thinking: []
+Tokens: 0 | Iterations: 0 | Time: 0.02s
+---
+Q: Какие персонажи есть в книге?
+A: HTTP Error 500: Internal Server Error
+Sources: []
+Thinking: []
+Tokens: 0 | Iterations: 0 | Time: 0.03s
+---
+Q: Есть ли романтические отношения?
+A: HTTP Error 500: Internal Server Error
+Sources: []
+Thinking: []
+Tokens: 0 | Iterations: 0 | Time: 0.02s
+---
+
+SUMMARY: 0/10 answered | avg 0.05s | total 0 tokens
