@@ -51,7 +51,7 @@ def _log_to_file(chunk_id: str, chunk_text: str, prompt: str, response: str, par
             f.write(response)
             f.write(f"\n\n--- PARSED RESULT ---\n")
             if parsed:
-                f.write(json.dumps(parsed, ensure_ascii=False, indent=2)[:3000])
+                f.write(json.dumps(parsed, ensure_ascii=False, indent=2))
             else:
                 f.write("None (parse failed)")
             f.write(f"\n")
@@ -60,8 +60,6 @@ def _log_to_file(chunk_id: str, chunk_text: str, prompt: str, response: str, par
 
 # Context-aware extraction prompt — sees existing entities
 CONTEXT_EXTRACTION_PROMPT = """You are a knowledge graph updater. Read the new content and update the knowledge graph.
-
-BASE CATEGORIES: персонаж, локация, событие, предмет, концепция, организация, код
 
 EXISTING ENTITIES:
 {existing_entities}
@@ -77,7 +75,7 @@ Return ONLY valid JSON (no markdown):
   "entities": [
     {{
       "name": "canonical name (lowercase, no brackets, reuse existing names)",
-      "type": "base category or specific type",
+      "type": "specific type (персонаж, локация, предмет, концепция, событие, организация, or your own)",
       "summary": "description in content language",
       "action": "create|update"
     }}
@@ -98,15 +96,17 @@ RULES:
 - REUSE existing entity names and types
 - action="update" if entity exists and you learn something new
 - action="create" only for genuinely new entities
-- MANDATORY: for each new entity, add BELONGS_TO edge to its base category
+- CRITICAL: connect entities TO EACH OTHER, not to abstract categories. Every entity must have at least one edge to another entity. Examples:
+  коридор → НАХОДИТСЯ_В → шахта (not коридор → BELONGS_TO → локации)
+  кён → РАБОТАЕТ_В → шахта (not кён → BELONGS_TO → персонажи)
+  шахта → ПРИНАДЛЕЖИТ → семья стоун
+- The MORE edges between entities, the BETTER. Prioritize relationships over isolated entities.
 - Evidence: first and last words of the text fragment that supports this edge
 - Summaries in the same language as content
 - Entity names: lowercase, no brackets"""
 
 # First chunk prompt (no existing entities yet)
 INITIAL_EXTRACTION_PROMPT = """You are a knowledge graph builder. Extract entities and relationships from this content.
-
-BASE CATEGORIES: персонаж, локация, событие, предмет, концепция, организация, код
 
 CONTENT (from {source_name}):
 {content}
@@ -119,7 +119,7 @@ Return ONLY valid JSON (no markdown):
   "entities": [
     {{
       "name": "canonical name (lowercase, no brackets)",
-      "type": "base category or specific type",
+      "type": "specific type (персонаж, локация, предмет, концепция, событие, организация, or your own)",
       "summary": "description in content language"
     }}
   ],
@@ -135,8 +135,11 @@ Return ONLY valid JSON (no markdown):
 }}
 
 RULES:
-- Use most specific type from base categories or create your own
-- MANDATORY: for each entity, add BELONGS_TO edge to its base category
+- CRITICAL: connect entities TO EACH OTHER. Every entity must have at least one edge to another entity. Examples:
+  коридор → НАХОДИТСЯ_В → шахта
+  кён → РАБОТАЕТ_В → шахта
+  шахта → ПРИНАДЛЕЖИТ → семья стоун
+- The MORE edges between entities, the BETTER. A graph without edges is useless.
 - Evidence: first and last words of the text fragment that supports this edge
 - Entity names: lowercase, no brackets
 - Summaries in the same language as content"""

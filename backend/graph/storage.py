@@ -440,12 +440,14 @@ class Neo4jStorage:
     # ============== Graph Navigation (for LLM agent) ==============
 
     def get_root_categories(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Get top-level categories/topics — nodes with no incoming BELONGS_TO/PART_OF edges."""
+        """Get top-level entities — those with many outgoing edges (hubs of the graph)."""
         cypher = """
         MATCH (n:Node)
-        WHERE n.type = 'category'
+        WHERE n.type <> 'document'
+        OPTIONAL MATCH (n)-[e:EDGE]->()
+        WITH n, count(e) as out_edges
+        ORDER BY out_edges DESC
         RETURN n.node_id as node_id, n.type as type, n.name as name, n.summary as summary
-        ORDER BY n.name
         LIMIT $limit
         """
         with self._driver.session(database=self.database) as session:

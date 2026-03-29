@@ -239,15 +239,6 @@ async def auto_pipeline(request: PipelineRequest):
     steps.append({"step": "scan", "time_s": round(_time.time() - step_start, 2), "files": len(all_files)})
     logger.info(f"Step 1 (scan): {len(all_files)} files")
 
-    # Seed base category nodes (roots of the tree)
-    BASE_CATEGORIES = ["персонажи", "локации", "события", "предметы", "концепции", "организации", "код"]
-    for cat in BASE_CATEGORIES:
-        s.create_node(GraphNode(
-            node_id=f"cat::{cat}", type="category", name=cat,
-            signature="", file_path="", line_start=0, line_end=0,
-            source_code="", summary=f"Базовая категория: {cat}", tags=[],
-        ))
-
     # STEP 2: Create chunks
     step_start = _time.time()
     doc_nodes = []
@@ -312,13 +303,16 @@ async def auto_pipeline(request: PipelineRequest):
         global_state = merge_file_states(file_states)
         logger.info(f"Extraction done: {len(global_state.entities)} entities, {len(global_state.edges)} edges")
 
+        # Build entity nodes — include source file hash for cross-file separation
         entity_node_ids = {}
+        source_files = list(files_chunks.keys())
+        source_hash = hashlib.sha256(",".join(source_files).encode()).hexdigest()[:8]
         for name, ent in global_state.entities.items():
-            node_id = f"entity::{name}"
+            node_id = f"entity::{name}::{source_hash}"
             entity_node_ids[name] = node_id
             entity_nodes.append(GraphNode(
                 node_id=node_id, type=ent.type, name=name,
-                signature="", file_path="", line_start=0, line_end=0,
+                signature=",".join(source_files)[:200], file_path="", line_start=0, line_end=0,
                 source_code="", summary=ent.summary, tags=[],
             ))
 
@@ -392,13 +386,14 @@ Decide what to do next. Return ONLY valid JSON (no markdown):
 {{
   "add_to_scratchpad": "summarize the useful new information in 1-3 sentences",
   "sufficient": true/false,
-  "next_action": "explore:entity_name" or "search:keyword" or "read_chunk:chunk_id" or "answer"
+  "next_action": "explore:entity_name" or "search:keyword" or "read_chunk:chunk_id" or "read_sequential:entity_name" or "answer"
 }}
 
 - "sufficient": true if you have enough to answer the question fully
 - "explore:name": follow edges of this entity to learn more
 - "search:keyword": search entities by name/keyword (use for direct lookups)
 - "read_chunk:id": load full chunk text for details
+- "read_sequential:name": read all chunks mentioning this entity in order (for chronology/path questions)
 - "answer": you have enough, generate the final answer"""
 
 
@@ -620,6 +615,19 @@ async def agent_query(request: AgentQueryRequest):
             node = s.get_node(chunk_id)
             if node and node.source_code:
                 scratchpad += f"\n[chunk {chunk_id}] {node.source_code[:2000]}"
+        elif next_action.startswith("read_sequential:"):
+            entity_name = next_action[16:]
+            chunks = s.get_chunks_for_entity(entity_name, limit=20)
+            if chunks:
+                # Sort by node_id to get file order (doc::hash::0, doc::hash::1, ...)
+                sorted_chunks = sorted(chunks, key=lambda c: c.get("node_id", ""))
+                seq_text = ""
+                for ch in sorted_chunks:
+                    content = ch.get("content", "")
+                    if content:
+                        seq_text += f"\n[{ch.get('name', '?')}] {content[:500]}\n"
+                scratchpad += f"\n[sequential:{entity_name}] {seq_text[:3000]}"
+                navigation_steps.append({"step": f"read_sequential:{entity_name}", "chunks_read": len(sorted_chunks)})
         else:
             break
 
