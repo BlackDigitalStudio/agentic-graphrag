@@ -3,10 +3,8 @@ Agentic GraphRAG - Neo4j Storage
 Хранилище графа на базе Neo4j
 """
 
-import os
 import json
 from typing import List, Optional, Dict, Any, Tuple
-from dataclasses import dataclass
 import logging
 
 from neo4j import GraphDatabase, Driver
@@ -144,14 +142,15 @@ class Neo4jStorage:
         """Удаление узла и связанных ребер"""
         cypher = """
         MATCH (n:Node {node_id: $node_id})
+        WITH n, count(n) > 0 as existed
         DETACH DELETE n
-        RETURN count(n) as deleted
+        RETURN existed
         """
-        
+
         with self._driver.session(database=self.database) as session:
             result = session.run(cypher, node_id=node_id)
             record = result.single()
-            return record and record["deleted"] > 0
+            return record and record["existed"]
     
     def get_nodes_bulk(self, node_ids: List[str]) -> List[GraphNode]:
         """Получение нескольких узлов за 1 Cypher-запрос (решение N+1)"""
@@ -386,7 +385,7 @@ class Neo4jStorage:
         params: Dict[str, Any] = {"lim": limit, "skp": skip}
 
         if query:
-            conditions.append("(n.name CONTAINS $q OR n.signature CONTAINS $q)")
+            conditions.append("(toLower(n.name) CONTAINS toLower($q) OR toLower(n.signature) CONTAINS toLower($q))")
             params["q"] = query
 
         if node_type:
@@ -418,10 +417,7 @@ class Neo4jStorage:
         """Get top-level categories/topics — nodes with no incoming BELONGS_TO/PART_OF edges."""
         cypher = """
         MATCH (n:Node)
-        WHERE n.type <> 'document'
-        AND NOT EXISTS { MATCH (n)-[:EDGE {type: 'BELONGS_TO'}]->() }
-        AND NOT EXISTS { MATCH (n)<-[:EDGE {type: 'CONTAINS'}]-() }
-        AND NOT EXISTS { MATCH (n)<-[:EDGE {type: 'PART_OF'}]-() }
+        WHERE n.type = 'category'
         RETURN n.node_id as node_id, n.type as type, n.name as name, n.summary as summary
         ORDER BY n.name
         LIMIT $limit
@@ -488,7 +484,7 @@ class Neo4jStorage:
                 if isinstance(meta, str):
                     try:
                         meta = json.loads(meta)
-                    except:
+                    except Exception:
                         meta = {}
                 ev_starts = meta.get("evidence_starts", "")
                 ev_ends = meta.get("evidence_ends", "")

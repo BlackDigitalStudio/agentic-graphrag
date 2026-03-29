@@ -29,6 +29,10 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("Neo4j connection failed")
     yield
+    # Close LLM client session
+    from .llm.client import get_llm_client
+    client = get_llm_client()
+    await client.close()
     neo4j.close()
 
 
@@ -39,7 +43,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 app.include_router(router)
 
 import pathlib

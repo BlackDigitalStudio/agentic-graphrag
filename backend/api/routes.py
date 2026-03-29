@@ -12,7 +12,7 @@ import zipfile
 import hashlib
 import json
 
-from ..graph.models import GraphNode, GraphEdge, IngestResult
+from ..graph.models import GraphNode, GraphEdge
 from ..graph.storage import Neo4jStorage
 from ..parser.txt_converter import scan_and_filter
 from ..llm.entity_extractor import extract_all_files, merge_file_states
@@ -196,6 +196,10 @@ async def upload_project(file: UploadFile = File(...)):
         with open(tmp, 'wb') as f:
             f.write(content)
         with zipfile.ZipFile(tmp, 'r') as z:
+            for member in z.namelist():
+                member_path = os.path.realpath(os.path.join(project_dir, member))
+                if not member_path.startswith(os.path.realpath(project_dir)):
+                    continue
             z.extractall(project_dir)
         os.remove(tmp)
     else:
@@ -214,7 +218,6 @@ async def auto_pipeline(request: PipelineRequest):
     """
     from ..llm.client import get_llm_client
     import time as _time
-    import math
 
     pipeline_start = _time.time()
 
@@ -326,7 +329,7 @@ async def auto_pipeline(request: PipelineRequest):
             ent_id = entity_node_ids.get(name)
             if not ent_id:
                 continue
-            for chunk_id in ent.source_chunks:
+            for chunk_id in set(ent.source_chunks):  # deduplicate
                 entity_edges.append(GraphEdge(source_id=chunk_id, target_id=ent_id,
                                               edge_type="MENTIONS", metadata={"confidence": ent.confidence}))
 
@@ -645,7 +648,7 @@ async def agent_query(request: AgentQueryRequest):
             "output_tokens": result["output_tokens"],
             "total_tokens": result["total_tokens"] + total_nav_tokens,
             "nav_tokens": total_nav_tokens,
-            "scratchpad_iterations": len([s for s in navigation_steps if "scratchpad" in s.get("step", "")]),
+            "scratchpad_iterations": len([step for step in navigation_steps if "scratchpad" in step.get("step", "")]),
             "context_entities": len(all_sources),
         },
         "navigation": navigation_steps,
@@ -661,12 +664,12 @@ def _parse_nav(text: str) -> Dict[str, Any]:
         text = "\n".join(lines)
     try:
         return json.loads(text)
-    except:
+    except Exception:
         start = text.find("{")
         end = text.rfind("}")
         if start >= 0 and end > start:
             try:
                 return json.loads(text[start:end+1])
-            except:
+            except Exception:
                 pass
     return {"selected": [], "reasoning": "parse error"}

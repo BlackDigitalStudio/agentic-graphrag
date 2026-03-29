@@ -220,9 +220,7 @@ class KnowledgeGraphState:
                 name = name[:name.index("[")].strip()
             if not name:
                 continue
-            conf = float(ent.get("confidence", 0.5))
-            if conf < 0.3:
-                continue
+            conf = float(ent.get("confidence", 0.8))
 
             if name in self.entities:
                 # Update existing
@@ -249,9 +247,7 @@ class KnowledgeGraphState:
             tgt = ed.get("target", "").lower().strip()
             if not src or not tgt:
                 continue
-            w = float(ed.get("weight", 0.5))
-            if w < 0.2:
-                continue
+            w = float(ed.get("weight", 0.8))
 
             edge_type = ed.get("type", "RELATES_TO")
 

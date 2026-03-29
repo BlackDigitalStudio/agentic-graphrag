@@ -150,7 +150,7 @@ class LLMClient:
                 block_reason = ""
                 try:
                     block_reason = data.get("promptFeedback", {}).get("blockReason", "")
-                except:
+                except Exception:
                     pass
                 logger.warning(f"Gemini empty: finishReason={finish_reason}, blockReason={block_reason}")
                 text = ""
@@ -177,7 +177,7 @@ class LLMClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        payload = {"model": self.model, "messages": messages, "max_tokens": 8192}
+        payload = {"model": self.model, "messages": messages, "max_tokens": 131072}
         headers = {"Authorization": f"Bearer {self.api_key}"}
 
         session = await self._get_session()
@@ -187,7 +187,11 @@ class LLMClient:
                 logger.error(f"OpenAI API error {resp.status}: {error}")
                 return {"text": "", "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
             data = await resp.json()
-            text = data["choices"][0]["message"]["content"]
+            try:
+                text = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError):
+                logger.warning(f"OpenAI empty response: {str(data)[:200]}")
+                text = ""
             usage = data.get("usage", {})
             return {
                 "text": text,
@@ -207,7 +211,7 @@ class LLMClient:
 
         payload = {
             "model": self.model,
-            "max_tokens": 1024,
+            "max_tokens": 131072,
             "messages": [{"role": "user", "content": prompt}],
         }
         if system:
