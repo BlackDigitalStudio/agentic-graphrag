@@ -1,601 +1,464 @@
 """
-Agentic GraphRAG - Neo4j Storage
-Хранилище графа на базе Neo4j
+ENN - SQLite Graph Storage
+Entities = neurons. Edges = synapses. No Neo4j, no Docker dependency.
 """
 
 import json
-from typing import List, Optional, Dict, Any, Tuple
+import sqlite3
+import os
 import logging
-
-from neo4j import GraphDatabase, Driver
-from neo4j.exceptions import ServiceUnavailable, ConstraintError
+from typing import List, Optional, Dict, Any, Tuple
 
 from .models import GraphNode, GraphEdge, SubgraphResult, validate_tags
 
 logger = logging.getLogger(__name__)
 
+DB_PATH = os.environ.get("ENN_DB_PATH", "/app/data/enn.db")
 
-class Neo4jStorage:
-    """
-    Хранилище графа на Neo4j.
-    
-    Операции:
-    - create_node / create_edge
-    - get_node / get_neighbors
-    - get_subgraph (с Context Pruning)
-    - bulk operations (UPSERT)
-    - search by type/tag
-    """
-    
-    def __init__(
-        self,
-        uri: str = "bolt://localhost:7687",
-        user: str = "neo4j",
-        password: str = "password",
-        database: str = "neo4j"
-    ):
-        self.uri = uri
-        self.user = user
-        self.password = password
-        self.database = database
-        self._driver: Optional[Driver] = None
-    
+
+class Storage:
+    """SQLite-based graph storage. Drop-in replacement for Neo4j."""
+
+    def __init__(self, db_path: str = None):
+        self.db_path = db_path or DB_PATH
+        self._conn: Optional[sqlite3.Connection] = None
+
     def connect(self) -> bool:
-        """Установка соединения с Neo4j"""
         try:
-            self._driver = GraphDatabase.driver(
-                self.uri,
-                auth=(self.user, self.password)
-            )
-            # Проверка соединения
-            self._driver.verify_connectivity()
-            logger.info(f"Connected to Neo4j: {self.uri}")
-            
-            # Инициализация индексов
-            self._create_constraints()
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._create_tables()
+            logger.info(f"SQLite connected: {self.db_path}")
             return True
-        except ServiceUnavailable as e:
-            logger.error(f"Failed to connect to Neo4j: {e}")
-            return False
         except Exception as e:
-            logger.error(f"Neo4j connection error: {e}")
+            logger.error(f"SQLite connection failed: {e}")
             return False
-    
+
     def close(self):
-        """Закрытие соединения"""
-        if self._driver:
-            self._driver.close()
-            logger.info("Neo4j connection closed")
-    
-    def _create_constraints(self):
-        """Создание индексов и constraints"""
-        constraints = [
-            "CREATE CONSTRAINT node_id IF NOT EXISTS FOR (n:Node) REQUIRE n.node_id IS UNIQUE",
-            "CREATE INDEX node_type IF NOT EXISTS FOR (n:Node) ON (n.type)",
-            "CREATE INDEX node_name IF NOT EXISTS FOR (n:Node) ON (n.name)",
-            "CREATE INDEX edge_type IF NOT EXISTS FOR ()-[e:EDGE]-() ON (e.type)"
-        ]
-        
-        with self._driver.session(database=self.database) as session:
-            for cql in constraints:
-                try:
-                    session.run(cql)
-                except ConstraintError:
-                    pass  # Constraint уже существует
-                except Exception as e:
-                    logger.warning(f"Constraint creation warning: {e}")
-    
+        if self._conn:
+            self._conn.close()
+            logger.info("SQLite closed")
+
+    def _create_tables(self):
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS nodes (
+                node_id TEXT PRIMARY KEY,
+                type TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                signature TEXT DEFAULT '',
+                file_path TEXT DEFAULT '',
+                line_start INTEGER DEFAULT 0,
+                line_end INTEGER DEFAULT 0,
+                source_code TEXT DEFAULT '',
+                summary TEXT DEFAULT '',
+                tags TEXT DEFAULT '[]',
+                created_at TEXT DEFAULT '',
+                updated_at TEXT DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT '',
+                metadata TEXT DEFAULT '{}',
+                created_at TEXT DEFAULT '',
+                UNIQUE(source_id, target_id, type)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
+            CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
+            CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
+            CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
+            CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);
+        """)
+        # Full-text search on name + summary
+        try:
+            self._conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+                    node_id, name, summary, content=nodes, content_rowid=rowid
+                )
+            """)
+        except Exception:
+            pass  # FTS already exists or not supported
+        self._conn.commit()
+
+    def _sync_fts(self, node_id: str, name: str, summary: str):
+        """Keep FTS index in sync."""
+        try:
+            self._conn.execute("INSERT OR REPLACE INTO nodes_fts(node_id, name, summary) VALUES (?, ?, ?)",
+                               (node_id, name, summary))
+        except Exception:
+            pass
+
     def __enter__(self):
         self.connect()
         return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
+
+    def __exit__(self, *args):
         self.close()
-    
+
     # ============== Node Operations ==============
-    
+
     def create_node(self, node: GraphNode) -> bool:
-        """
-        Создание узла в графе.
-        Использует UPSERT (MERGE) для инкрементальных обновлений.
-        """
-        # Валидация тегов
         node.tags = validate_tags(node.tags)
-        
-        cypher = """
-        MERGE (n:Node {node_id: $node_id})
-        SET n.type = $type,
-            n.name = $name,
-            n.signature = $signature,
-            n.file_path = $file_path,
-            n.line_start = $line_start,
-            n.line_end = $line_end,
-            n.source_code = $source_code,
-            n.summary = $summary,
-            n.tags = $tags,
-            n.updated_at = datetime()
-        RETURN n
-        """
-        
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, **node.to_dict())
-            return result.single() is not None
-    
+        try:
+            self._conn.execute("""
+                INSERT OR REPLACE INTO nodes (node_id, type, name, signature, file_path,
+                    line_start, line_end, source_code, summary, tags, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (node.node_id, node.type, node.name, node.signature, node.file_path,
+                  node.line_start, node.line_end, node.source_code, node.summary,
+                  json.dumps(node.tags), node.created_at, node.updated_at))
+            self._sync_fts(node.node_id, node.name, node.summary)
+            self._conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Create node failed: {e}")
+            return False
+
     def get_node(self, node_id: str) -> Optional[GraphNode]:
-        """Получение узла по ID"""
-        cypher = "MATCH (n:Node {node_id: $node_id}) RETURN n"
-        
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, node_id=node_id)
-            record = result.single()
-            
-            if record:
-                return GraphNode.from_dict(dict(record["n"]))
-            return None
-    
+        row = self._conn.execute("SELECT * FROM nodes WHERE node_id = ?", (node_id,)).fetchone()
+        if row:
+            return self._row_to_node(row)
+        return None
+
     def get_node_code(self, node_id: str) -> Optional[str]:
-        """Получение только исходного кода узла"""
         node = self.get_node(node_id)
         return node.source_code if node else None
-    
-    def delete_node(self, node_id: str) -> bool:
-        """Удаление узла и связанных ребер"""
-        cypher = """
-        MATCH (n:Node {node_id: $node_id})
-        WITH n, count(n) > 0 as existed
-        DETACH DELETE n
-        RETURN existed
-        """
 
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, node_id=node_id)
-            record = result.single()
-            return record and record["existed"]
-    
+    def delete_node(self, node_id: str) -> bool:
+        cur = self._conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
+        self._conn.execute("DELETE FROM edges WHERE source_id = ? OR target_id = ?", (node_id, node_id))
+        self._conn.commit()
+        return cur.rowcount > 0
+
     def get_nodes_bulk(self, node_ids: List[str]) -> List[GraphNode]:
-        """Получение нескольких узлов за 1 Cypher-запрос (решение N+1)"""
         if not node_ids:
             return []
-        cypher = """
-        MATCH (n:Node)
-        WHERE n.node_id IN $node_ids
-        RETURN n
-        """
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, node_ids=node_ids)
-            return [GraphNode.from_dict(dict(record["n"])) for record in result]
+        placeholders = ",".join("?" * len(node_ids))
+        rows = self._conn.execute(f"SELECT * FROM nodes WHERE node_id IN ({placeholders})", node_ids).fetchall()
+        return [self._row_to_node(r) for r in rows]
 
     def update_node(self, node: GraphNode) -> bool:
-        """Обновление свойств существующего узла"""
-        cypher = """
-        MATCH (n:Node {node_id: $node_id})
-        SET n.summary = $summary,
-            n.updated_at = datetime()
-        RETURN n
-        """
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, node_id=node.node_id, summary=node.summary)
-            return result.single() is not None
+        cur = self._conn.execute("UPDATE nodes SET summary = ?, updated_at = ? WHERE node_id = ?",
+                                  (node.summary, node.updated_at, node.node_id))
+        self._sync_fts(node.node_id, node.name, node.summary)
+        self._conn.commit()
+        return cur.rowcount > 0
 
     def bulk_create_nodes(self, nodes: List[GraphNode], chunk_size: int = 500) -> int:
-        """Массовое создание узлов. Коммитит порциями по chunk_size для больших проектов."""
         count = 0
         for i in range(0, len(nodes), chunk_size):
             chunk = nodes[i:i + chunk_size]
-            with self._driver.session(database=self.database) as session:
-                with session.begin_transaction() as tx:
-                    for node in chunk:
-                        node.tags = validate_tags(node.tags)
-                        cypher = """
-                        MERGE (n:Node {node_id: $node_id})
-                        SET n.type = $type,
-                            n.name = $name,
-                            n.signature = $signature,
-                            n.file_path = $file_path,
-                            n.line_start = $line_start,
-                            n.line_end = $line_end,
-                            n.source_code = $source_code,
-                            n.summary = $summary,
-                            n.tags = $tags,
-                            n.updated_at = datetime()
-                        """
-                        tx.run(cypher, **node.to_dict())
-                        count += 1
+            for node in chunk:
+                node.tags = validate_tags(node.tags)
+                self._conn.execute("""
+                    INSERT OR REPLACE INTO nodes (node_id, type, name, signature, file_path,
+                        line_start, line_end, source_code, summary, tags, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (node.node_id, node.type, node.name, node.signature, node.file_path,
+                      node.line_start, node.line_end, node.source_code, node.summary,
+                      json.dumps(node.tags), node.created_at, node.updated_at))
+                self._sync_fts(node.node_id, node.name, node.summary)
+                count += 1
+            self._conn.commit()
         return count
-    
+
     # ============== Edge Operations ==============
-    
+
     def create_edge(self, edge: GraphEdge) -> bool:
-        """Создание ребра между узлами"""
-        cypher = """
-        MATCH (source:Node {node_id: $source_id})
-        MATCH (target:Node {node_id: $target_id})
-        MERGE (source)-[e:EDGE]->(target)
-        SET e.type = $type,
-            e.metadata = $metadata,
-            e.created_at = datetime()
-        RETURN e
-        """
-        
-        with self._driver.session(database=self.database) as session:
-            params = edge.to_dict()
-            params["metadata"] = json.dumps(params.get("metadata", {}))
-            result = session.run(cypher, **params)
-            return result.single() is not None
+        try:
+            self._conn.execute("""
+                INSERT OR REPLACE INTO edges (source_id, target_id, type, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (edge.source_id, edge.target_id, edge.edge_type,
+                  json.dumps(edge.metadata), edge.created_at))
+            self._conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Create edge failed: {e}")
+            return False
 
     def delete_edge(self, source_id: str, target_id: str, edge_type: str) -> bool:
-        """Удаление ребра"""
-        cypher = """
-        MATCH (source:Node {node_id: $source_id})-[e:EDGE {type: $type}]->(target:Node {node_id: $target_id})
-        DELETE e
-        RETURN count(e) as deleted
-        """
-        
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, source_id=source_id, target_id=target_id, type=edge_type)
-            record = result.single()
-            return record and record["deleted"] > 0
-    
+        cur = self._conn.execute("DELETE FROM edges WHERE source_id = ? AND target_id = ? AND type = ?",
+                                  (source_id, target_id, edge_type))
+        self._conn.commit()
+        return cur.rowcount > 0
+
     def bulk_create_edges(self, edges: List[GraphEdge], chunk_size: int = 500) -> int:
-        """Массовое создание ребер. Коммитит порциями."""
         count = 0
         for i in range(0, len(edges), chunk_size):
             chunk = edges[i:i + chunk_size]
-            with self._driver.session(database=self.database) as session:
-                with session.begin_transaction() as tx:
-                    for edge in chunk:
-                        cypher = """
-                        MATCH (source:Node {node_id: $source_id})
-                        MATCH (target:Node {node_id: $target_id})
-                        MERGE (source)-[e:EDGE]->(target)
-                        SET e.type = $type, e.metadata = $metadata, e.created_at = datetime()
-                        """
-                        params = edge.to_dict()
-                        params["metadata"] = json.dumps(params.get("metadata", {}))
-                        tx.run(cypher, **params)
-                        count += 1
+            for edge in chunk:
+                self._conn.execute("""
+                    INSERT OR REPLACE INTO edges (source_id, target_id, type, metadata, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (edge.source_id, edge.target_id, edge.edge_type,
+                      json.dumps(edge.metadata), edge.created_at))
+                count += 1
+            self._conn.commit()
         return count
-    
+
     # ============== Navigation ==============
-    
-    def get_neighbors(
-        self,
-        node_id: str,
-        depth: int = 1,
-        edge_types: List[str] = None,
-        direction: str = "both"  # "outgoing", "incoming", "both"
-    ) -> Tuple[List[GraphNode], List[GraphEdge]]:
-        """
-        Получение соседей узла с заданной глубиной.
 
-        Args:
-            node_id: ID стартового узла
-            depth: Глубина обхода (1-3)
-            edge_types: Фильтр по типам ребер
-            direction: Направление ("outgoing", "incoming", "both")
-        """
-        max_depth = min(depth, 3)
+    def get_neighbors(self, node_id: str, depth: int = 1, edge_types: List[str] = None,
+                      direction: str = "both") -> Tuple[List[GraphNode], List[GraphEdge]]:
+        nodes = {}
+        edges = []
+        visited = {node_id}
+        frontier = [node_id]
 
-        # Формирование паттерна направления
-        if direction == "outgoing":
-            left, right = "-", "->"
-        elif direction == "incoming":
-            left, right = "<-", "-"
-        else:
-            left, right = "-", "-"
+        for _ in range(min(depth, 3)):
+            next_frontier = []
+            for nid in frontier:
+                # Outgoing
+                if direction in ("both", "outgoing"):
+                    rows = self._conn.execute(
+                        "SELECT * FROM edges WHERE source_id = ?", (nid,)).fetchall()
+                    for r in rows:
+                        if edge_types and r["type"] not in edge_types:
+                            continue
+                        edges.append(self._row_to_edge(r))
+                        if r["target_id"] not in visited:
+                            visited.add(r["target_id"])
+                            next_frontier.append(r["target_id"])
 
-        # Фильтр по типу ребра
-        type_filter = ""
-        params: Dict[str, Any] = {"node_id": node_id}
-        if edge_types:
-            type_filter = "WHERE ALL(r IN relationships(path) WHERE r.type IN $edge_types)"
-            params["edge_types"] = edge_types
+                # Incoming
+                if direction in ("both", "incoming"):
+                    rows = self._conn.execute(
+                        "SELECT * FROM edges WHERE target_id = ?", (nid,)).fetchall()
+                    for r in rows:
+                        if edge_types and r["type"] not in edge_types:
+                            continue
+                        edges.append(self._row_to_edge(r))
+                        if r["source_id"] not in visited:
+                            visited.add(r["source_id"])
+                            next_frontier.append(r["source_id"])
 
-        cypher = f"""
-        MATCH path = (start:Node {{node_id: $node_id}}){left}[*1..{max_depth}]{right}(end:Node)
-        {type_filter}
-        WITH collect(nodes(path)) AS all_path_nodes, collect(relationships(path)) AS all_path_edges
-        WITH reduce(acc = [], ns IN all_path_nodes | acc + ns) AS flat_nodes,
-             reduce(acc = [], es IN all_path_edges | acc + es) AS flat_edges
-        UNWIND flat_nodes AS n
-        WITH collect(DISTINCT n) AS unique_nodes, flat_edges
-        UNWIND flat_edges AS e
-        WITH unique_nodes, collect(DISTINCT e) AS unique_edges
-        RETURN unique_nodes, unique_edges
-        """
+            frontier = next_frontier
 
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, **params)
-            record = result.single()
+        # Fetch all neighbor nodes
+        all_ids = list(visited)
+        if all_ids:
+            placeholders = ",".join("?" * len(all_ids))
+            rows = self._conn.execute(f"SELECT * FROM nodes WHERE node_id IN ({placeholders})", all_ids).fetchall()
+            nodes = {r["node_id"]: self._row_to_node(r) for r in rows}
 
-            if not record:
-                return [], []
+        return list(nodes.values()), edges
 
-            nodes = [GraphNode.from_dict(dict(n)) for n in record["unique_nodes"]]
+    def get_subgraph(self, node_id: str, depth: int = 2, edge_types: List[str] = None,
+                     include_code: bool = False) -> Optional[SubgraphResult]:
+        center = self.get_node(node_id)
+        if not center:
+            return None
+        nodes, edges = self.get_neighbors(node_id, depth, edge_types)
+        if center.node_id not in {n.node_id for n in nodes}:
+            nodes.insert(0, center)
+        return SubgraphResult(
+            center_node=center, nodes=nodes, edges=edges,
+            depth=depth, total_nodes=len(nodes), total_edges=len(edges)
+        )
 
-            # Ребра из Neo4j relationship objects
-            edges = []
-            for rel in record["unique_edges"]:
-                try:
-                    src_id = dict(rel.start_node).get("node_id", "")
-                    tgt_id = dict(rel.end_node).get("node_id", "")
-                except Exception:
-                    continue
-                if not src_id or not tgt_id:
-                    continue
-                edge = GraphEdge(
-                    source_id=src_id,
-                    target_id=tgt_id,
-                    edge_type=rel.get("type", "RELATES_TO"),
-                    metadata=json.loads(rel.get("metadata", "{}")) if rel.get("metadata") else {}
-                )
-                edges.append(edge)
-
-            return nodes, edges
-    
-    def get_subgraph(
-        self,
-        node_id: str,
-        depth: int = 2,
-        edge_types: List[str] = None,
-        include_code: bool = False
-    ) -> Optional[SubgraphResult]:
-        """Single-query subgraph fetch — center node + neighbors in one round-trip."""
-        max_depth = min(depth, 3)
-        type_filter = ""
-        params: Dict[str, Any] = {"node_id": node_id}
-        if edge_types:
-            type_filter = "WHERE ALL(r IN relationships(path) WHERE r.type IN $edge_types)"
-            params["edge_types"] = edge_types
-
-        cypher = f"""
-        MATCH (center:Node {{node_id: $node_id}})
-        OPTIONAL MATCH path = (center)-[*1..{max_depth}]-(end:Node)
-        {type_filter}
-        WITH center,
-             collect(nodes(path)) AS all_path_nodes,
-             collect(relationships(path)) AS all_path_edges
-        WITH center,
-             reduce(acc = [], ns IN all_path_nodes | acc + ns) AS flat_nodes,
-             reduce(acc = [], es IN all_path_edges | acc + es) AS flat_edges
-        WITH center, flat_nodes, flat_edges
-        UNWIND (CASE WHEN size(flat_nodes) > 0 THEN flat_nodes ELSE [center] END) AS n
-        WITH center, collect(DISTINCT n) AS unique_nodes, flat_edges
-        UNWIND (CASE WHEN size(flat_edges) > 0 THEN flat_edges ELSE [null] END) AS e
-        WITH center, unique_nodes, collect(DISTINCT e) AS raw_edges
-        RETURN center, unique_nodes, [e IN raw_edges WHERE e IS NOT NULL] AS unique_edges
-        """
-
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, **params)
-            record = result.single()
-            if not record or not record["center"]:
-                return None
-
-            center_node = GraphNode.from_dict(dict(record["center"]))
-            nodes = [GraphNode.from_dict(dict(n)) for n in record["unique_nodes"]]
-            edges = []
-            for rel in record["unique_edges"]:
-                try:
-                    src_id = dict(rel.start_node).get("node_id", "")
-                    tgt_id = dict(rel.end_node).get("node_id", "")
-                except Exception:
-                    continue
-                if not src_id or not tgt_id:
-                    continue
-                edge = GraphEdge(
-                    source_id=src_id,
-                    target_id=tgt_id,
-                    edge_type=rel.get("type", "RELATES_TO"),
-                    metadata=json.loads(rel.get("metadata", "{}")) if rel.get("metadata") else {}
-                )
-                edges.append(edge)
-
-            if center_node.node_id not in {n.node_id for n in nodes}:
-                nodes.insert(0, center_node)
-
-            return SubgraphResult(
-                center_node=center_node, nodes=nodes, edges=edges,
-                depth=depth, total_nodes=len(nodes), total_edges=len(edges)
-            )
-    
     # ============== Search ==============
-    
-    def count_nodes(self) -> int:
-        """Общее кол-во узлов в графе"""
-        with self._driver.session(database=self.database) as session:
-            result = session.run("MATCH (n:Node) RETURN count(n) as cnt")
-            return result.single()["cnt"]
 
-    def search_nodes(
-        self,
-        query: str = None,
-        node_type: str = None,
-        tags: List[str] = None,
-        limit: int = 50,
-        skip: int = 0
-    ) -> List[GraphNode]:
-        """
-        Поиск узлов по различным критериям.
-        Поддерживает пагинацию через skip.
-        """
+    def count_nodes(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) as cnt FROM nodes").fetchone()
+        return row["cnt"]
+
+    def search_nodes(self, query: str = None, node_type: str = None,
+                     tags: List[str] = None, limit: int = 50, skip: int = 0) -> List[GraphNode]:
         conditions = []
-        params: Dict[str, Any] = {"lim": limit, "skp": skip}
+        params = []
 
         if query:
-            conditions.append("(toLower(n.name) CONTAINS toLower($q) OR toLower(n.signature) CONTAINS toLower($q))")
-            params["q"] = query
-
+            conditions.append("(LOWER(name) LIKE ? OR LOWER(summary) LIKE ?)")
+            params.extend([f"%{query.lower()}%", f"%{query.lower()}%"])
         if node_type:
-            conditions.append("n.type = $ntype")
-            params["ntype"] = node_type
+            conditions.append("type = ?")
+            params.append(node_type)
 
-        if tags:
-            conditions.append("ANY(tag IN $tags WHERE tag IN n.tags)")
-            params["tags"] = tags
+        where = " AND ".join(conditions) if conditions else "1=1"
+        params.extend([limit, skip])
 
-        where_clause = " AND ".join(conditions) if conditions else "true"
+        rows = self._conn.execute(
+            f"SELECT * FROM nodes WHERE {where} ORDER BY node_id LIMIT ? OFFSET ?", params
+        ).fetchall()
+        return [self._row_to_node(r) for r in rows]
 
-        cypher = f"""
-        MATCH (n:Node)
-        WHERE {where_clause}
-        RETURN n
-        ORDER BY n.node_id
-        SKIP $skp
-        LIMIT $lim
-        """
-
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, **params)
-            return [GraphNode.from_dict(dict(record["n"])) for record in result]
-    
     # ============== Graph Navigation (for LLM agent) ==============
 
     def get_root_categories(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Get top-level entities — those with many outgoing edges (hubs of the graph)."""
-        cypher = """
-        MATCH (n:Node)
-        WHERE NOT n.type IN ['document', 'cached_answer']
-        OPTIONAL MATCH (n)-[e:EDGE]->()
-        WITH n, count(e) as out_edges
-        ORDER BY out_edges DESC
-        RETURN n.node_id as node_id, n.type as type, n.name as name, n.summary as summary
-        LIMIT $limit
-        """
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, limit=limit)
-            return [dict(r) for r in result]
+        """Top entities by edge count (most connected neurons)."""
+        rows = self._conn.execute("""
+            SELECT n.node_id, n.type, n.name, n.summary, COUNT(e.id) as edge_count
+            FROM nodes n
+            LEFT JOIN edges e ON e.source_id = n.node_id
+            WHERE n.type NOT IN ('document', 'cached_answer')
+            GROUP BY n.node_id
+            ORDER BY edge_count DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [{"node_id": r["node_id"], "type": r["type"], "name": r["name"], "summary": r["summary"]} for r in rows]
 
     def get_children(self, node_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Get child nodes connected via outgoing edges."""
-        cypher = """
-        MATCH (parent:Node {node_id: $node_id})-[:EDGE]->(child:Node)
-        RETURN child.node_id as node_id, child.type as type, child.name as name, child.summary as summary
-        ORDER BY child.name
-        LIMIT $limit
-        """
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, node_id=node_id, limit=limit)
-            return [dict(r) for r in result]
+        """Get nodes connected via outgoing edges."""
+        rows = self._conn.execute("""
+            SELECT n.node_id, n.type, n.name, n.summary
+            FROM edges e JOIN nodes n ON e.target_id = n.node_id
+            WHERE e.source_id = ? LIMIT ?
+        """, (node_id, limit)).fetchall()
+        return [dict(r) for r in rows]
 
     def get_related(self, node_id: str, limit: int = 30) -> List[Dict[str, Any]]:
         """Get all directly connected nodes with edge info."""
-        cypher = """
-        MATCH (n:Node {node_id: $node_id})-[e:EDGE]-(other:Node)
-        RETURN other.node_id as node_id, other.type as type, other.name as name,
-               other.summary as summary, e.type as edge_type,
-               startNode(e).node_id = $node_id as outgoing
-        ORDER BY other.name
-        LIMIT $limit
-        """
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, node_id=node_id, limit=limit)
-            return [dict(r) for r in result]
+        results = []
+        # Outgoing
+        rows = self._conn.execute("""
+            SELECT n.node_id, n.type, n.name, n.summary, e.type as edge_type, 1 as outgoing
+            FROM edges e JOIN nodes n ON e.target_id = n.node_id
+            WHERE e.source_id = ? LIMIT ?
+        """, (node_id, limit)).fetchall()
+        results.extend([dict(r) for r in rows])
+
+        # Incoming
+        rows = self._conn.execute("""
+            SELECT n.node_id, n.type, n.name, n.summary, e.type as edge_type, 0 as outgoing
+            FROM edges e JOIN nodes n ON e.source_id = n.node_id
+            WHERE e.target_id = ? LIMIT ?
+        """, (node_id, limit)).fetchall()
+        results.extend([dict(r) for r in rows])
+
+        return results[:limit]
 
     def get_chunks_for_entity(self, entity_name: str, limit: int = 5) -> List[Dict[str, Any]]:
         """Get document chunks that MENTION a given entity."""
-        cypher = """
-        MATCH (chunk:Node)-[e:EDGE {type: 'MENTIONS'}]->(entity:Node {name: $name})
-        WHERE chunk.type = 'document'
-        RETURN chunk.node_id as node_id, chunk.source_code as content,
-               chunk.file_path as file_path, chunk.name as name
-        LIMIT $limit
-        """
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, name=entity_name, limit=limit)
-            return [dict(r) for r in result]
+        rows = self._conn.execute("""
+            SELECT n.node_id, n.source_code as content, n.file_path, n.name
+            FROM edges e
+            JOIN nodes n ON e.source_id = n.node_id
+            JOIN nodes target ON e.target_id = target.node_id
+            WHERE target.name = ? AND e.type = 'MENTIONS' AND n.type = 'document'
+            LIMIT ?
+        """, (entity_name, limit)).fetchall()
+        return [dict(r) for r in rows]
 
     def get_evidence_for_entity(self, entity_name: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get evidence fragments from edges connected to an entity.
-        Returns edge metadata with evidence_starts/evidence_ends + source chunk for extraction.
-        """
-        cypher = """
-        MATCH (a:Node)-[e:EDGE]-(b:Node)
-        WHERE (a.name = $name OR b.name = $name) AND e.metadata IS NOT NULL
-        RETURN a.name as source, b.name as target, e.type as edge_type,
-               e.metadata as metadata
-        LIMIT $lim
-        """
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, name=entity_name, lim=limit)
-            evidences = []
-            for r in result:
-                meta = r.get("metadata", "{}")
-                if isinstance(meta, str):
-                    try:
-                        meta = json.loads(meta)
-                    except Exception:
-                        meta = {}
-                ev_starts = meta.get("evidence_starts", "")
-                ev_ends = meta.get("evidence_ends", "")
-                chunk_id = meta.get("source_chunk", "")
-                if ev_starts or ev_ends:
-                    evidences.append({
-                        "source": r["source"], "target": r["target"],
-                        "edge_type": r["edge_type"],
-                        "evidence_starts": ev_starts, "evidence_ends": ev_ends,
-                        "source_chunk": chunk_id,
-                    })
-            return evidences
+        """Get evidence fragments from edges connected to an entity."""
+        rows = self._conn.execute("""
+            SELECT n1.name as source, n2.name as target, e.type as edge_type, e.metadata
+            FROM edges e
+            JOIN nodes n1 ON e.source_id = n1.node_id
+            JOIN nodes n2 ON e.target_id = n2.node_id
+            WHERE (n1.name = ? OR n2.name = ?) AND e.metadata != '{}'
+            LIMIT ?
+        """, (entity_name, entity_name, limit)).fetchall()
+
+        evidences = []
+        for r in rows:
+            try:
+                meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            except Exception:
+                meta = {}
+            ev_starts = meta.get("evidence_starts", "")
+            ev_ends = meta.get("evidence_ends", "")
+            if ev_starts or ev_ends:
+                evidences.append({
+                    "source": r["source"], "target": r["target"],
+                    "edge_type": r["edge_type"],
+                    "evidence_starts": ev_starts, "evidence_ends": ev_ends,
+                    "source_chunk": meta.get("source_chunk", ""),
+                })
+        return evidences
 
     def search_entities_by_name(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """Search entities by name — bidirectional CONTAINS for Russian declension.
-        'кёна' finds 'кён' and vice versa.
-        Short terms (< 3 chars) use exact match only to avoid slow scans.
-        """
+        """Search entities by name or summary — bidirectional for Russian declension."""
         if len(query) >= 3:
-            cypher = """
-            MATCH (n:Node)
-            WHERE n.type <> 'document'
-              AND (toLower(n.name) CONTAINS toLower($search_term)
-                   OR toLower($search_term) CONTAINS toLower(n.name))
-            RETURN n.node_id as node_id, n.type as type, n.name as name, n.summary as summary
-            ORDER BY n.name
-            LIMIT $lim
-            """
+            # Try FTS first
+            try:
+                rows = self._conn.execute("""
+                    SELECT n.node_id, n.type, n.name, n.summary
+                    FROM nodes_fts fts JOIN nodes n ON fts.node_id = n.node_id
+                    WHERE nodes_fts MATCH ? AND n.type != 'document'
+                    LIMIT ?
+                """, (query, limit)).fetchall()
+                if rows:
+                    return [dict(r) for r in rows]
+            except Exception:
+                pass
+
+            # Fallback: LIKE search (bidirectional)
+            q = query.lower()
+            rows = self._conn.execute("""
+                SELECT node_id, type, name, summary FROM nodes
+                WHERE type != 'document'
+                  AND (LOWER(name) LIKE ? OR LOWER(summary) LIKE ? OR ? LIKE '%' || LOWER(name) || '%')
+                ORDER BY name LIMIT ?
+            """, (f"%{q}%", f"%{q}%", q, limit)).fetchall()
         else:
-            cypher = """
-            MATCH (n:Node)
-            WHERE n.type <> 'document'
-              AND toLower(n.name) = toLower($search_term)
-            RETURN n.node_id as node_id, n.type as type, n.name as name, n.summary as summary
-            ORDER BY n.name
-            LIMIT $lim
-            """
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, search_term=query, lim=limit)
-            return [dict(r) for r in result]
+            rows = self._conn.execute("""
+                SELECT node_id, type, name, summary FROM nodes
+                WHERE type != 'document' AND LOWER(name) = LOWER(?)
+                LIMIT ?
+            """, (query, limit)).fetchall()
+
+        return [dict(r) for r in rows]
 
     # ============== Statistics ==============
-    
+
     def get_stats(self) -> Dict[str, Any]:
-        """Получение статистики графа"""
-        cypher = """
-        CALL {
-            MATCH (n:Node) RETURN count(n) as node_count, collect(DISTINCT n.type) as types
+        node_count = self._conn.execute("SELECT COUNT(*) as c FROM nodes").fetchone()["c"]
+        edge_count = self._conn.execute("SELECT COUNT(*) as c FROM edges").fetchone()["c"]
+        types = self._conn.execute("SELECT DISTINCT type FROM nodes").fetchall()
+        type_list = [r["type"] for r in types]
+        return {
+            "total_nodes": node_count,
+            "total_edges": edge_count,
+            "node_types": type_list,
+            "type_count": len(type_list),
         }
-        CALL {
-            MATCH ()-[e]->() RETURN count(e) as edge_count
-        }
-        RETURN node_count, edge_count, types, size(types) as type_count
-        """
-        
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher)
-            record = result.single()
-            
-            if record:
-                return {
-                    "total_nodes": record["node_count"],
-                    "total_edges": record["edge_count"],
-                    "node_types": record["types"],
-                    "type_count": record["type_count"]
-                }
-            return {"total_nodes": 0, "total_edges": 0, "node_types": [], "type_count": 0}
-    
+
     def clear_all(self):
-        """Очистка всего графа (для тестирования)"""
-        cypher = "MATCH (n) DETACH DELETE n"
-        with self._driver.session(database=self.database) as session:
-            session.run(cypher)
+        self._conn.execute("DELETE FROM edges")
+        self._conn.execute("DELETE FROM nodes")
+        try:
+            self._conn.execute("DELETE FROM nodes_fts")
+        except Exception:
+            pass
+        self._conn.commit()
         logger.info("Graph cleared")
+
+    # ============== Helpers ==============
+
+    def _row_to_node(self, row) -> GraphNode:
+        tags = []
+        try:
+            tags = json.loads(row["tags"]) if row["tags"] else []
+        except Exception:
+            pass
+        return GraphNode(
+            node_id=row["node_id"], type=row["type"], name=row["name"],
+            signature=row["signature"] or "", file_path=row["file_path"] or "",
+            line_start=row["line_start"] or 0, line_end=row["line_end"] or 0,
+            source_code=row["source_code"] or "", summary=row["summary"] or "",
+            tags=tags, created_at=row["created_at"] or "", updated_at=row["updated_at"] or "",
+        )
+
+    def _row_to_edge(self, row) -> GraphEdge:
+        meta = {}
+        try:
+            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+        except Exception:
+            pass
+        return GraphEdge(
+            source_id=row["source_id"], target_id=row["target_id"],
+            edge_type=row["type"], metadata=meta,
+            created_at=row["created_at"] or "",
+        )
+
+
+# Backward compatibility alias
+Neo4jStorage = Storage

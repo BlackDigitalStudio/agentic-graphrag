@@ -13,7 +13,7 @@ import hashlib
 import json
 
 from ..graph.models import GraphNode, GraphEdge
-from ..graph.storage import Neo4jStorage
+from ..graph.storage import Storage
 from ..parser.txt_converter import scan_and_filter
 from ..llm.entity_extractor import extract_all_files, merge_file_states
 
@@ -21,17 +21,17 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["graph"])
 
-_storage: Optional[Neo4jStorage] = None
+_storage: Optional[Storage] = None
 
 
-def set_storage(s: Neo4jStorage):
+def set_storage(s: Storage):
     global _storage
     _storage = s
 
 
-def get_storage() -> Neo4jStorage:
-    if _storage is None or _storage._driver is None:
-        raise HTTPException(status_code=503, detail="Neo4j not connected")
+def get_storage() -> Storage:
+    if _storage is None or _storage._conn is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
     return _storage
 
 
@@ -39,7 +39,7 @@ def get_storage() -> Neo4jStorage:
 
 class HealthResponse(BaseModel):
     status: str
-    neo4j_connected: bool
+    db_connected: bool
     llm_provider: str
     llm_model: str
     llm_configured: bool
@@ -75,16 +75,16 @@ class AgentQueryRequest(BaseModel):
 async def health_check():
     from ..config import get_settings
     settings = get_settings()
-    neo4j_ok = False
-    if _storage and _storage._driver:
+    db_ok = False
+    if _storage and _storage._conn:
         try:
-            _storage._driver.verify_connectivity()
-            neo4j_ok = True
+            _storage._conn.execute("SELECT 1")
+            db_ok = True
         except Exception:
             pass
     return HealthResponse(
-        status="healthy" if neo4j_ok else "degraded",
-        neo4j_connected=neo4j_ok,
+        status="healthy" if db_ok else "degraded",
+        db_connected=db_ok,
         llm_provider=settings.llm_provider,
         llm_model=settings.llm_model,
         llm_configured=bool(settings.llm_api_key),
@@ -341,29 +341,31 @@ async def auto_pipeline(request: PipelineRequest):
 
 # ============== ENN Query — Free Thinking ==============
 
-THINK_PROMPT = """You are an intelligent agent with access to an External Neural Network (ENN) — a graph of entities (neurons) and relationships (synapses).
+THINK_PROMPT = """Тебе задали вопрос. У тебя есть граф знаний — сущности и связи между ними. Используй инструменты чтобы найти ответ.
 
-QUESTION: {question}
+Вопрос: {question}
 
-GRAPH OVERVIEW (top neurons by connectivity):
+Обзор графа (самые связанные сущности):
 {graph_overview}
 
-YOUR TOOLS:
-- search(keyword) — find neurons by name or description
-- explore(name) — see all synapses of a neuron
-- read_chunk(id) — read original source text
-- read_sequential(name) — read all source chunks mentioning this neuron in order
-- answer(text) — give the final answer
+Инструменты:
+- search:слово — найти сущности по имени или описанию
+- explore:имя — посмотреть все связи этой сущности с другими
+- read_chunk:id — прочитать исходный текст
+- read_sequential:имя — прочитать все фрагменты текста где упоминается эта сущность по порядку
+- answer:текст — дать ответ
 
-SCRATCHPAD (your notes so far):
+Твои заметки:
 {scratchpad}
 
-Think freely. Reason about the question. Decide what to do next.
-Return ONLY valid JSON:
+Если search не находит нужное — попробуй explore ближайшей сущности.
+Если explore не даёт ответа — прочитай исходный текст через read_chunk или read_sequential.
+
+Верни JSON:
 {{
-  "thinking": "your reasoning about the question and what you know so far",
-  "notes": "key facts to remember (added to scratchpad)",
-  "action": "search:keyword" or "explore:name" or "read_chunk:id" or "read_sequential:name" or "answer:your final answer"
+  "thinking": "ход мысли",
+  "notes": "что запомнить",
+  "action": "инструмент:параметр"
 }}"""
 
 

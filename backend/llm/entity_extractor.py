@@ -59,89 +59,96 @@ def _log_to_file(chunk_id: str, chunk_text: str, prompt: str, response: str, par
     except Exception as e:
         logger.warning(f"Failed to write extraction log: {e}")
 
-# ENN: External Neural Network — context-aware extraction
-# Entities = neurons. Edges = synapses. No categories, no abstractions.
-CONTEXT_EXTRACTION_PROMPT = """You are building an External Neural Network. Every entity is a neuron. Every edge is a synapse. Your job: extract as many neurons and synapses as possible from the content.
+CONTEXT_EXTRACTION_PROMPT = """Прочитай текст. Найди все сущности и связи между ними. Обнови граф.
 
-EXISTING NEURONS:
+Уже известные сущности:
 {existing_entities}
 
-CONTENT (from {source_name}):
+Текст ({source_name}):
 {content}
 
 ---
 
-Return ONLY valid JSON (no markdown):
+Верни JSON:
 
 {{
   "entities": [
     {{
-      "name": "canonical name (lowercase, reuse existing names)",
-      "type": "what it is (person, place, object, ability, event, concept...)",
-      "summary": "detailed description in content language",
-      "action": "create|update"
+      "name": "имя (строчные, если сущность уже есть — используй то же имя)",
+      "type": "кто/что это (человек, место, предмет, способность, событие...)",
+      "summary": "подробное описание на языке текста",
+      "action": "create если новая, update если уже есть"
     }}
   ],
   "edges": [
     {{
-      "source": "entity name",
-      "target": "entity name",
-      "type": "RELATIONSHIP",
-      "evidence_starts": "first few words of relevant text",
-      "evidence_ends": "last few words of relevant text",
-      "action": "create|update"
+      "source": "имя сущности",
+      "target": "имя сущности",
+      "type": "тип связи (РАБОТАЕТ_В, ВЛАДЕЕТ, СРАЖАЕТСЯ_С, НАХОДИТСЯ_В...)",
+      "evidence_starts": "первые слова фрагмента текста подтверждающего связь",
+      "evidence_ends": "последние слова этого фрагмента"
+    }}
+  ],
+  "contradictions": [
+    {{
+      "entity": "имя сущности",
+      "old_fact": "что было известно раньше",
+      "new_fact": "что стало известно сейчас",
+      "evidence_starts": "первые слова подтверждения"
     }}
   ]
 }}
 
-RULES:
-- REUSE existing neuron names when referring to the same thing
-- Extract EVERY person, place, object, ability, event, relationship you find
-- NEVER create abstract categories (no "персонажи", "локации", "концепции")
-- ONLY concrete entities that exist in the text
-- Connect EVERY entity to at least one other entity — isolated neurons are useless
-- The MORE synapses the BETTER — every interaction, every location link, every possession
-- Evidence: first and last words of the text fragment that proves this connection
-- Summaries: detailed, in the same language as content
-- Entity names: lowercase, no brackets"""
+Что извлекать:
+- Людей, существ, персонажей
+- Места, здания, локации
+- Предметы, инструменты, артефакты
+- Способности, навыки, магию
+- События, действия, происшествия
+- Отношения между всем перечисленным
 
-# First chunk prompt (no existing entities yet)
-INITIAL_EXTRACTION_PROMPT = """You are building an External Neural Network. Every entity is a neuron. Every edge is a synapse. Extract as many neurons and synapses as possible.
+Каждая сущность должна быть связана хотя бы с одной другой.
+Если факт о сущности изменился — запиши в contradictions.
+Не создавай абстрактные категории. Только конкретные вещи из текста."""
 
-CONTENT (from {source_name}):
+INITIAL_EXTRACTION_PROMPT = """Прочитай текст. Найди все сущности и связи между ними.
+
+Текст ({source_name}):
 {content}
 
 ---
 
-Return ONLY valid JSON (no markdown):
+Верни JSON:
 
 {{
   "entities": [
     {{
-      "name": "canonical name (lowercase)",
-      "type": "what it is (person, place, object, ability, event, concept...)",
-      "summary": "detailed description in content language"
+      "name": "имя (строчные буквы)",
+      "type": "кто/что это (человек, место, предмет, способность, событие...)",
+      "summary": "подробное описание на языке текста"
     }}
   ],
   "edges": [
     {{
-      "source": "entity name",
-      "target": "entity name",
-      "type": "RELATIONSHIP",
-      "evidence_starts": "first few words of relevant text",
-      "evidence_ends": "last few words of relevant text"
+      "source": "имя сущности",
+      "target": "имя сущности",
+      "type": "тип связи (РАБОТАЕТ_В, ВЛАДЕЕТ, СРАЖАЕТСЯ_С, НАХОДИТСЯ_В...)",
+      "evidence_starts": "первые слова фрагмента текста подтверждающего связь",
+      "evidence_ends": "последние слова этого фрагмента"
     }}
   ]
 }}
 
-RULES:
-- Extract EVERY person, place, object, ability, event, relationship
-- NEVER create abstract categories — only concrete entities from text
-- Connect EVERY entity to at least one other entity
-- The MORE synapses the BETTER — every interaction, location, possession
-- Evidence: first and last words of text fragment proving the connection
-- Entity names: lowercase, no brackets
-- Summaries: detailed, same language as content"""
+Что извлекать:
+- Людей, существ, персонажей
+- Места, здания, локации
+- Предметы, инструменты, артефакты
+- Способности, навыки, магию
+- События, действия, происшествия
+- Отношения между всем перечисленным
+
+Каждая сущность должна быть связана хотя бы с одной другой.
+Не создавай абстрактные категории. Только конкретные вещи из текста."""
 
 
 @dataclass

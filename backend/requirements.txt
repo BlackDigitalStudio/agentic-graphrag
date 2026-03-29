@@ -7,9 +7,6 @@ pydantic>=2.9.2
 pydantic-settings>=2.5.2
 python-multipart>=0.0.12
 
-# Graph Database (Neo4j)
-neo4j>=5.25.0
-
 # LLM Integration
 aiohttp>=3.10.5
 

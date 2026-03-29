@@ -1,26 +1,7 @@
-# ENN - Docker Compose
-# Neo4j + Backend only. No vector database needed.
+# ENN - External Neural Network
+# SQLite backend. No external databases.
 
 services:
-  neo4j:
-    image: neo4j:latest
-    container_name: enn-neo4j
-    ports:
-      - "7474:7474"
-      - "7687:7687"
-    environment:
-      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-password}
-      - NEO4J_server_memory_heap_max__size=2G
-      - NEO4J_server_memory_pagecache_size=1G
-    volumes:
-      - neo4j_data:/data
-      - neo4j_logs:/logs
-    healthcheck:
-      test: ["CMD-SHELL", "cypher-shell -u neo4j -p ${NEO4J_PASSWORD:-password} 'RETURN 1' || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   backend:
     build:
       context: ./backend
@@ -29,27 +10,13 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - NEO4J_URI=bolt://neo4j:7687
-      - NEO4J_USER=neo4j
-      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
       - LLM_PROVIDER=openai
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_MODEL=MiniMax-M2.7-highspeed
       - LLM_BASE_URL=https://api.minimax.io/v1/chat/completions
       - PYTHONUNBUFFERED=1
-    depends_on:
-      neo4j:
-        condition: service_healthy
     volumes:
       - ./backend:/app/backend
-      - ./test_data:/app/test_data
+      - ./data:/app/data
       - ./logs:/app/logs
-      - ${DATA_DIR:-./test_data}:/app/data:ro
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-
-volumes:
-  neo4j_data:
-  neo4j_logs:
+      - ./test_data:/app/test_data

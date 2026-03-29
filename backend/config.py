@@ -6,24 +6,18 @@ from typing import Optional
 
 
 class Settings(BaseSettings):
-    # Neo4j Configuration
-    neo4j_uri: str = "bolt://localhost:7687"
-    neo4j_user: str = "neo4j"
-    neo4j_password: str = "password"
-
     # LLM Configuration
-    # Поддерживаемые провайдеры: "gemini", "openai", "anthropic"
     llm_provider: str = "openai"
     llm_api_key: str = ""
     llm_model: str = "MiniMax-M2.7-highspeed"
     llm_base_url: Optional[str] = "https://api.minimax.io/v1/chat/completions"
 
-    # Application Settings
+    # Application
     app_name: str = "ENN"
     debug: bool = True
 
-    # Graph Settings
-    max_subgraph_depth: int = 3
+    # Database
+    db_path: str = "/app/data/enn.db"
 
     class Config:
         env_file = ".env"

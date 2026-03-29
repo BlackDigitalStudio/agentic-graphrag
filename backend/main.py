@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import get_settings
 from .api.routes import router, set_storage
-from .graph.storage import Neo4jStorage
+from .graph.storage import Storage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -21,18 +21,17 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    neo4j = Neo4jStorage(uri=settings.neo4j_uri, user=settings.neo4j_user, password=settings.neo4j_password)
-    if neo4j.connect():
-        logger.info("Neo4j connected")
-        set_storage(neo4j)
+    db = Storage(db_path="/app/data/enn.db")
+    if db.connect():
+        logger.info("SQLite connected")
+        set_storage(db)
     else:
-        logger.warning("Neo4j connection failed")
+        logger.warning("SQLite connection failed")
     yield
-    # Close LLM client session
     from .llm.client import get_llm_client
     client = get_llm_client()
     await client.close()
-    neo4j.close()
+    db.close()
 
 
 app = FastAPI(
