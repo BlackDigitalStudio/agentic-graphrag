@@ -1,4 +1,4 @@
-# Tree Base - Configuration
+# ENN - Configuration
 
 from pydantic_settings import BaseSettings
 from functools import lru_cache
@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     llm_base_url: Optional[str] = "https://api.minimax.io/v1/chat/completions"
 
     # Application Settings
-    app_name: str = "Tree Base"
+    app_name: str = "ENN"
     debug: bool = True
 
     # Graph Settings

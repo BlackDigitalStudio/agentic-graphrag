@@ -1,6 +1,6 @@
 """
-Tree Base - API Routes
-Universal knowledge graph with graph navigation.
+ENN - External Neural Network - API Routes
+Entities = neurons. Edges = synapses. LLM thinks freely.
 """
 
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
@@ -65,8 +65,8 @@ class PipelineRequest(BaseModel):
 
 
 class AgentQueryRequest(BaseModel):
-    question: str = Field(..., description="Question to ask the knowledge graph")
-    max_depth: int = Field(default=3, description="Max navigation depth")
+    question: str = Field(..., description="Question to ask the ENN")
+    max_iterations: int = Field(default=10, description="Max thinking iterations")
 
 
 # ============== Health & Stats ==============
@@ -88,7 +88,7 @@ async def health_check():
         llm_provider=settings.llm_provider,
         llm_model=settings.llm_model,
         llm_configured=bool(settings.llm_api_key),
-        version="2.0.0"
+        version="3.0.0"
     )
 
 
@@ -105,7 +105,7 @@ async def clear_graph():
     return {"message": "Graph cleared"}
 
 
-# ============== Graph Navigation ==============
+# ============== Graph Access ==============
 
 @router.get("/node/{node_id}")
 async def get_node(node_id: str):
@@ -143,15 +143,12 @@ async def search_nodes(request: SearchRequest):
 UPLOAD_DIR = "/app/uploads"
 
 
-def _split_into_chunks(text: str, max_size: int = 8000) -> List[str]:
-    """Split text into chunks <= max_size, breaking on paragraph boundaries."""
+def _split_into_chunks(text: str, max_size: int = 12000) -> List[str]:
     if len(text) <= max_size:
         return [text]
-
     chunks = []
     paragraphs = text.split('\n\n')
     current = ""
-
     for para in paragraphs:
         if len(para) > max_size:
             if current:
@@ -174,21 +171,17 @@ def _split_into_chunks(text: str, max_size: int = 8000) -> List[str]:
             current = para
         else:
             current = current + '\n\n' + para if current else para
-
     if current.strip():
         chunks.append(current)
-
     return chunks if chunks else [text[:max_size]]
 
 
 @router.post("/upload")
 async def upload_project(file: UploadFile = File(...)):
-    """Upload file → auto-run pipeline."""
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     original = file.filename or "project"
     project_name = os.path.splitext(original)[0]
     project_dir = os.path.join(UPLOAD_DIR, project_name)
-
     content = await file.read()
     if original.endswith('.zip'):
         os.makedirs(project_dir, exist_ok=True)
@@ -206,21 +199,16 @@ async def upload_project(file: UploadFile = File(...)):
         os.makedirs(project_dir, exist_ok=True)
         with open(os.path.join(project_dir, original), 'wb') as f:
             f.write(content)
-
-    request = PipelineRequest(directory=project_dir)
-    return await auto_pipeline(request)
+    return await auto_pipeline(PipelineRequest(directory=project_dir))
 
 
 @router.post("/pipeline")
 async def auto_pipeline(request: PipelineRequest):
-    """
-    Tree Base pipeline: scan → chunks → entity extraction. No embeddings needed.
-    """
+    """ENN pipeline: scan → chunks → neural extraction (entities + synapses)."""
     from ..llm.client import get_llm_client
     import time as _time
 
     pipeline_start = _time.time()
-
     directory = request.directory
     if request.project_name:
         directory = os.path.join(UPLOAD_DIR, request.project_name)
@@ -255,16 +243,13 @@ async def auto_pipeline(request: PipelineRequest):
             file_hash = hashlib.sha256(rel_path.encode()).hexdigest()[:16]
             name = os.path.basename(fp)
             chunks = _split_into_chunks(content, CHUNK_SIZE)
-
             prev_id = None
             for ci, chunk_text in enumerate(chunks):
                 node_id = f"doc::{file_hash}::{ci}"
                 doc_nodes.append(GraphNode(
-                    node_id=node_id, type="document",
-                    name=f"{name}::chunk_{ci}", signature=rel_path,
-                    file_path=rel_path, line_start=0, line_end=0,
-                    source_code=chunk_text,
-                    summary=f"{name} [{ci+1}/{len(chunks)}]", tags=[],
+                    node_id=node_id, type="document", name=f"{name}::chunk_{ci}",
+                    signature=rel_path, file_path=rel_path, line_start=0, line_end=0,
+                    source_code=chunk_text, summary=f"{name} [{ci+1}/{len(chunks)}]", tags=[],
                 ))
                 if prev_id:
                     chunk_edges.append(GraphEdge(source_id=prev_id, target_id=node_id, edge_type="NEXT_CHUNK"))
@@ -276,12 +261,11 @@ async def auto_pipeline(request: PipelineRequest):
         s.bulk_create_nodes(doc_nodes)
     if chunk_edges:
         s.bulk_create_edges(chunk_edges)
-
     steps.append({"step": "chunks", "time_s": round(_time.time() - step_start, 2),
                    "files": len(all_files), "chunks": len(doc_nodes)})
     logger.info(f"Step 2 (chunks): {len(all_files)} files → {len(doc_nodes)} chunks")
 
-    # STEP 3: Entity Extraction (context-aware)
+    # STEP 3: Neural Extraction (neurons + synapses)
     step_start = _time.time()
     entity_nodes = []
     entity_edges = []
@@ -298,12 +282,10 @@ async def auto_pipeline(request: PipelineRequest):
             files_chunks[fp].append({"node_id": node.node_id, "content": content})
 
         logger.info(f"Step 3 (extraction): {sum(len(c) for c in files_chunks.values())} chunks across {len(files_chunks)} files")
-
         file_states = await extract_all_files(client, files_chunks, concurrency=10)
         global_state = merge_file_states(file_states)
-        logger.info(f"Extraction done: {len(global_state.entities)} entities, {len(global_state.edges)} edges")
+        logger.info(f"Extraction done: {len(global_state.entities)} neurons, {len(global_state.edges)} synapses")
 
-        # Build entity nodes — include source file hash for cross-file separation
         entity_node_ids = {}
         source_files = list(files_chunks.keys())
         source_hash = hashlib.sha256(",".join(source_files).encode()).hexdigest()[:8]
@@ -323,7 +305,7 @@ async def auto_pipeline(request: PipelineRequest):
             ent_id = entity_node_ids.get(name)
             if not ent_id:
                 continue
-            for chunk_id in set(ent.source_chunks):  # deduplicate
+            for chunk_id in set(ent.source_chunks):
                 entity_edges.append(GraphEdge(source_id=chunk_id, target_id=ent_id,
                                               edge_type="MENTIONS", metadata={"confidence": ent.confidence}))
 
@@ -345,8 +327,8 @@ async def auto_pipeline(request: PipelineRequest):
             s.bulk_create_edges(entity_edges)
 
     steps.append({"step": "extraction", "time_s": round(_time.time() - step_start, 2),
-                   "entities": len(entity_nodes), "edges": len(entity_edges)})
-    logger.info(f"Step 3 (extraction): {len(entity_nodes)} entities, {len(entity_edges)} edges")
+                   "neurons": len(entity_nodes), "synapses": len(entity_edges)})
+    logger.info(f"Step 3: {len(entity_nodes)} neurons, {len(entity_edges)} synapses")
 
     total_time = round(_time.time() - pipeline_start, 2)
     return {
@@ -357,64 +339,37 @@ async def auto_pipeline(request: PipelineRequest):
     }
 
 
-# ============== Agent Query (Graph Navigation) ==============
+# ============== ENN Query — Free Thinking ==============
 
-NAVIGATE_PROMPT = """You are navigating a knowledge graph to find information.
-
-QUESTION: {question}
-
-AVAILABLE NODES:
-{nodes_list}
-
-Pick the most relevant nodes. Return ONLY valid JSON (no markdown):
-{{"selected": ["name1", "name2"], "reasoning": "why"}}
-
-Select up to 5. If none relevant: {{"selected": [], "reasoning": "none relevant"}}"""
-
-
-SCRATCHPAD_PROMPT = """You are searching a knowledge graph to answer a question.
+THINK_PROMPT = """You are an intelligent agent with access to an External Neural Network (ENN) — a graph of entities (neurons) and relationships (synapses).
 
 QUESTION: {question}
 
-SCRATCHPAD (what you've found so far):
+GRAPH OVERVIEW (top neurons by connectivity):
+{graph_overview}
+
+YOUR TOOLS:
+- search(keyword) — find neurons by name or description
+- explore(name) — see all synapses of a neuron
+- read_chunk(id) — read original source text
+- read_sequential(name) — read all source chunks mentioning this neuron in order
+- answer(text) — give the final answer
+
+SCRATCHPAD (your notes so far):
 {scratchpad}
 
-NEW INFORMATION:
-{new_info}
-
-Decide what to do next. Return ONLY valid JSON (no markdown):
+Think freely. Reason about the question. Decide what to do next.
+Return ONLY valid JSON:
 {{
-  "add_to_scratchpad": "summarize the useful new information in 1-3 sentences",
-  "sufficient": true/false,
-  "next_action": "explore:entity_name" or "search:keyword" or "read_chunk:chunk_id" or "read_sequential:entity_name" or "answer"
-}}
-
-- "sufficient": true if you have enough to answer the question fully
-- "explore:name": follow edges of this entity to learn more
-- "search:keyword": search entities by name/keyword (use for direct lookups)
-- "read_chunk:id": load full chunk text for details
-- "read_sequential:name": read all chunks mentioning this entity in order (for chronology/path questions)
-- "answer": you have enough, generate the final answer"""
-
-
-ANSWER_PROMPT = """You are a knowledge assistant with access to a universal knowledge graph.
-The graph contains entities from diverse sources (code, literature, recipes, finance, psychology, etc).
-
-Answer based ONLY on the provided context. If contradictions exist, explain both sides.
-If insufficient context, say so. Answer in the same language as the question.
-
-QUESTION: {question}
-
-COLLECTED CONTEXT:
-{context}
-
-RELATIONSHIPS:
-{edges}"""
+  "thinking": "your reasoning about the question and what you know so far",
+  "notes": "key facts to remember (added to scratchpad)",
+  "action": "search:keyword" or "explore:name" or "read_chunk:id" or "read_sequential:name" or "answer:your final answer"
+}}"""
 
 
 @router.post("/agent/query")
 async def agent_query(request: AgentQueryRequest):
-    """Graph navigation query: LLM navigates graph to find answers."""
+    """ENN query: LLM thinks freely with access to the neural network."""
     import time as _time
     start = _time.time()
 
@@ -425,259 +380,132 @@ async def agent_query(request: AgentQueryRequest):
     if not client.api_key:
         raise HTTPException(status_code=503, detail="LLM not configured")
 
-    navigation_steps = []
-    found_entities = []
-    total_nav_tokens = 0
+    # Graph overview: top neurons by connectivity
+    top_neurons = s.get_root_categories(limit=30)
+    graph_overview = "\n".join([
+        f"- {n['name']} [{n['type']}]: {n.get('summary', '')[:100]}"
+        for n in top_neurons
+    ]) if top_neurons else "(empty graph)"
 
-    # Step 0: Auto-search — every word from question searched in entity names
-    STOP_WORDS = {"кто", "что", "как", "где", "когда", "почему", "какой", "какая", "какие",
-                  "это", "ли", "не", "да", "нет", "все", "весь", "был", "быть", "есть",
-                  "the", "is", "are", "was", "were", "who", "what", "how", "where", "when",
-                  "why", "which", "do", "does", "did", "will", "can", "has", "have", "had",
-                  "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "from"}
-
-    words = [w for w in request.question.lower().split() if len(w) > 2 and w not in STOP_WORDS]
-    auto_results = []
-    for word in words:
-        matches = s.search_entities_by_name(word, limit=5)
-        auto_results.extend(matches)
-
-    if auto_results:
-        # Deduplicate and rank: exact match > substring
-        seen = {}
-        for r in auto_results:
-            nid = r["node_id"]
-            if nid not in seen:
-                # Score: exact match = 2, substring = 1
-                name_lower = r["name"].lower()
-                score = 2 if any(w == name_lower for w in words) else 1
-                seen[nid] = {**r, "_score": score}
-            else:
-                # Boost if matched multiple words
-                seen[nid]["_score"] = seen[nid].get("_score", 1) + 1
-
-        ranked = sorted(seen.values(), key=lambda x: -x.get("_score", 0))
-        found_entities = ranked[:10]
-
-        # Pass to LLM with summaries and paths
-        auto_info = "\n".join([f"- {e['name']} [{e['type']}]: {e.get('summary', '')}" for e in found_entities])
-        navigation_steps.append({
-            "step": "auto_search",
-            "found": len(found_entities),
-            "words_searched": words,
-            "results": [e["name"] for e in found_entities[:5]],
-        })
-
-    # Step 1: LLM navigates root categories (only if auto-search found nothing)
-    if not found_entities:
-        roots = s.get_root_categories(limit=50)
-        if not roots:
-            raise HTTPException(status_code=404, detail="Knowledge graph is empty")
-
-        nodes_list = "\n".join([f"- {r['name']} [{r['type']}]: {r.get('summary', '')}" for r in roots])
-        nav_prompt = NAVIGATE_PROMPT.format(question=request.question, nodes_list=nodes_list)
-        nav_result = await client.generate_with_metrics(nav_prompt)
-        total_nav_tokens += nav_result.get("total_tokens", 0)
-
-        nav_data = _parse_nav(nav_result["text"])
-        navigation_steps.append({"step": "root_nav", "options": len(roots), "selected": nav_data.get("selected", [])})
-
-        for name in nav_data.get("selected", [])[:3]:
-            matches = [r for r in roots if r["name"].lower() == name.lower()]
-            if not matches:
-                matches = s.search_entities_by_name(name, limit=1)
-            if not matches:
-                continue
-
-            children = s.get_children(matches[0]["node_id"], limit=30)
-            if children:
-                cl = "\n".join([f"- {c['name']} [{c['type']}]: {c.get('summary', '')}" for c in children])
-                nav2 = await client.generate_with_metrics(NAVIGATE_PROMPT.format(question=request.question, nodes_list=cl))
-                total_nav_tokens += nav2.get("total_tokens", 0)
-                nav2_data = _parse_nav(nav2["text"])
-                navigation_steps.append({"step": f"drill:{name}", "options": len(children), "selected": nav2_data.get("selected", [])})
-                for cn in nav2_data.get("selected", [])[:5]:
-                    cm = [c for c in children if c["name"].lower() == cn.lower()]
-                    if cm:
-                        found_entities.append(cm[0])
-            else:
-                found_entities.append(matches[0])
-
-    if not found_entities:
-        raise HTTPException(status_code=404, detail="No relevant information found")
-
-    # Step 3: Scratchpad loop — iteratively gather context
     scratchpad = ""
-    edge_parts = []
-    all_sources = list(found_entities[:10])
-    max_iterations = 8
+    steps = []
+    total_tokens = 0
+    all_sources = []
+    answer_text = "I could not find enough information to answer."
 
-    for iteration in range(max_iterations):
-        # Gather new info from current entities (batch fetch to avoid N+1)
-        new_info_parts = []
-        ent_ids = [e["node_id"] for e in found_entities[:5]]
-        batch_nodes = {n.node_id: n for n in s.get_nodes_bulk(ent_ids)}
-
-        for ent in found_entities[:5]:
-            node = batch_nodes.get(ent["node_id"])
-            if not node:
-                continue
-            info = f"[{node.type}] {node.name}"
-            if node.summary:
-                info += f": {node.summary}"
-            new_info_parts.append(info)
-
-            for rel in s.get_related(ent["node_id"], limit=15):
-                d = "→" if rel.get("outgoing") else "←"
-                edge_parts.append(f"  {node.name} {d}[{rel.get('edge_type', '?')}]{d} {rel['name']}")
-                if rel.get("summary"):
-                    new_info_parts.append(f"  [{rel['type']}] {rel['name']}: {rel['summary']}")
-
-            # Read evidence fragments first (cheap), full chunks as fallback
-            evidences = s.get_evidence_for_entity(ent.get("name", ""), limit=5)
-            if evidences:
-                for ev in evidences:
-                    ev_text = f"  [{ev['edge_type']}] {ev['source']} → {ev['target']}"
-                    if ev.get("evidence_starts"):
-                        # Extract text between markers from source chunk
-                        chunk_id = ev.get("source_chunk", "")
-                        if chunk_id:
-                            chunk_node = s.get_node(chunk_id)
-                            if chunk_node and chunk_node.source_code:
-                                src = chunk_node.source_code
-                                start_idx = src.find(ev["evidence_starts"])
-                                end_idx = src.find(ev["evidence_ends"], max(0, start_idx)) + len(ev["evidence_ends"]) if ev.get("evidence_ends") else -1
-                                if start_idx >= 0 and end_idx > start_idx:
-                                    ev_text += f": {src[start_idx:end_idx]}"
-                    new_info_parts.append(ev_text)
-            else:
-                # Fallback: read full chunks
-                for chunk in s.get_chunks_for_entity(ent.get("name", ""), limit=2):
-                    if chunk.get("content"):
-                        new_info_parts.append(f"[source: {chunk.get('file_path', '?')}]\n{chunk['content']}")
-
-        new_info = "\n".join(new_info_parts)
-
-        # Ask LLM: enough or explore more?
-        sp_prompt = SCRATCHPAD_PROMPT.format(
+    for iteration in range(request.max_iterations):
+        prompt = THINK_PROMPT.format(
             question=request.question,
-            scratchpad=scratchpad or "(empty — first iteration)",
-            new_info=new_info[:4000],
+            graph_overview=graph_overview,
+            scratchpad=scratchpad or "(empty — start thinking)",
         )
-        sp_result = await client.generate_with_metrics(sp_prompt)
-        total_nav_tokens += sp_result.get("total_tokens", 0)
-        sp_data = _parse_nav(sp_result["text"])
 
-        # Update scratchpad
-        addition = sp_data.get("add_to_scratchpad", "")
-        if addition:
-            scratchpad += f"\n[iter {iteration+1}] {addition}"
+        result = await client.generate_with_metrics(prompt)
+        total_tokens += result.get("total_tokens", 0)
 
-        # Compress scratchpad only when it fills 80% of context window
-        # MiniMax M2.7: 205K tokens ≈ ~600K chars. 80% = ~480K chars.
-        CONTEXT_LIMIT_CHARS = 480000
-        if len(scratchpad) > CONTEXT_LIMIT_CHARS:
-            compress_prompt = f"Compress this scratchpad to key facts only, keep all entity names and relationships:\n\n{scratchpad}"
-            compress_result = await client.generate_with_metrics(compress_prompt)
-            total_nav_tokens += compress_result.get("total_tokens", 0)
-            scratchpad = f"[compressed]\n{compress_result['text']}"
-            navigation_steps.append({"step": "scratchpad_compressed", "old_len": len(scratchpad)})
+        # Strip <think> blocks from reasoning models
+        text = result["text"]
+        if "<think>" in text and "</think>" in text:
+            text = text[text.find("</think>") + 8:].strip()
 
-        navigation_steps.append({
-            "step": f"scratchpad_iter_{iteration+1}",
-            "sufficient": sp_data.get("sufficient", False),
-            "next_action": sp_data.get("next_action", "answer"),
-        })
+        data = _parse_json(text)
+        thinking = data.get("thinking", "")
+        notes = data.get("notes", "")
+        action = data.get("action", "answer:I don't have enough information")
 
-        # Check if sufficient
-        if sp_data.get("sufficient", False) or sp_data.get("next_action") == "answer":
+        if notes:
+            scratchpad += f"\n[{iteration+1}] {notes}"
+
+        steps.append({"step": iteration + 1, "thinking": thinking[:200], "action": action})
+
+        # Execute action
+        if action.startswith("answer:"):
+            answer_text = action[7:]
             break
 
-        # Follow next action
-        next_action = sp_data.get("next_action", "")
-        if next_action.startswith("explore:"):
-            entity_name = next_action[8:]
-            matches = s.search_entities_by_name(entity_name, limit=3)
-            found_entities = matches
-            all_sources.extend(matches)
-        elif next_action.startswith("search:"):
-            keyword = next_action[7:]
+        elif action.startswith("search:"):
+            keyword = action[7:]
             matches = s.search_entities_by_name(keyword, limit=10)
+            all_sources.extend(matches)
             if matches:
-                found_entities = matches
-                all_sources.extend(matches)
-                search_info = "\n".join([f"- {m['name']} [{m['type']}]: {m.get('summary', '')}" for m in matches])
-                scratchpad += f"\n[search '{keyword}'] found {len(matches)} entities:\n{search_info}"
+                info = "\n".join([f"- {m['name']} [{m['type']}]: {m.get('summary', '')}" for m in matches])
+                scratchpad += f"\n[search:{keyword}] {info}"
             else:
-                scratchpad += f"\n[search '{keyword}'] no results"
-        elif next_action.startswith("read_chunk:"):
-            chunk_id = next_action[11:]
+                scratchpad += f"\n[search:{keyword}] nothing found"
+
+        elif action.startswith("explore:"):
+            entity_name = action[8:]
+            matches = s.search_entities_by_name(entity_name, limit=1)
+            if matches:
+                all_sources.extend(matches)
+                related = s.get_related(matches[0]["node_id"], limit=20)
+                edges_info = "\n".join([
+                    f"  {'→' if r.get('outgoing') else '←'}[{r.get('edge_type','?')}] {r['name']}: {r.get('summary','')[:80]}"
+                    for r in related
+                ])
+                scratchpad += f"\n[explore:{entity_name}]\n{edges_info}"
+
+                # Read evidence
+                evidences = s.get_evidence_for_entity(entity_name, limit=5)
+                for ev in evidences:
+                    chunk_id = ev.get("source_chunk", "")
+                    if chunk_id and ev.get("evidence_starts"):
+                        chunk_node = s.get_node(chunk_id)
+                        if chunk_node and chunk_node.source_code:
+                            src = chunk_node.source_code
+                            si = src.find(ev["evidence_starts"])
+                            ei = src.find(ev.get("evidence_ends", ""), max(0, si))
+                            if si >= 0 and ei > si:
+                                scratchpad += f"\n  [evidence] {src[si:ei + len(ev.get('evidence_ends', ''))]}"
+
+        elif action.startswith("read_chunk:"):
+            chunk_id = action[11:]
             node = s.get_node(chunk_id)
             if node and node.source_code:
-                scratchpad += f"\n[chunk {chunk_id}] {node.source_code[:2000]}"
-        elif next_action.startswith("read_sequential:"):
-            entity_name = next_action[16:]
+                scratchpad += f"\n[chunk] {node.source_code[:2000]}"
+
+        elif action.startswith("read_sequential:"):
+            entity_name = action[16:]
             chunks = s.get_chunks_for_entity(entity_name, limit=20)
             if chunks:
-                # Sort by node_id to get file order (doc::hash::0, doc::hash::1, ...)
                 sorted_chunks = sorted(chunks, key=lambda c: c.get("node_id", ""))
-                seq_text = ""
-                for ch in sorted_chunks:
-                    content = ch.get("content", "")
-                    if content:
-                        seq_text += f"\n[{ch.get('name', '?')}] {content[:500]}\n"
-                scratchpad += f"\n[sequential:{entity_name}] {seq_text[:3000]}"
-                navigation_steps.append({"step": f"read_sequential:{entity_name}", "chunks_read": len(sorted_chunks)})
-        else:
-            break
+                seq = "\n".join([ch.get("content", "")[:500] for ch in sorted_chunks if ch.get("content")])
+                scratchpad += f"\n[sequential:{entity_name}] {seq[:3000]}"
 
-    # Step 4: Final answer from scratchpad
-    answer_prompt = ANSWER_PROMPT.format(
-        question=request.question,
-        context=scratchpad,
-        edges="\n".join(list(set(edge_parts))[:30]),
-    )
-    result = await client.generate_with_metrics(answer_prompt)
+        # Compress if needed (80% of 205K tokens ≈ 480K chars)
+        if len(scratchpad) > 480000:
+            cr = await client.generate_with_metrics(f"Compress to key facts, keep all names and relationships:\n\n{scratchpad}")
+            total_tokens += cr.get("total_tokens", 0)
+            scratchpad = f"[compressed]\n{cr['text']}"
 
-    # Cache answer in graph — next identical query finds it via auto-search
+    # Cache answer
     try:
-        answer_hash = hashlib.sha256(request.question.encode()).hexdigest()[:12]
-        cache_node = GraphNode(
-            node_id=f"answer::{answer_hash}", type="cached_answer",
+        ah = hashlib.sha256(request.question.encode()).hexdigest()[:12]
+        s.create_node(GraphNode(
+            node_id=f"answer::{ah}", type="cached_answer",
             name=request.question[:100].lower(), signature=request.question,
             file_path="", line_start=0, line_end=0,
-            source_code=result["text"][:2000], summary=result["text"][:200],
-            tags=[],
-        )
-        s.create_node(cache_node)
-        # Link to source entities
+            source_code=answer_text[:2000], summary=answer_text[:200], tags=[],
+        ))
         for ent in all_sources[:5]:
-            s.create_edge(GraphEdge(
-                source_id=f"answer::{answer_hash}", target_id=ent["node_id"],
-                edge_type="ANSWERED_FROM",
-            ))
-    except Exception as e:
-        logger.warning(f"Failed to cache answer: {e}")
+            s.create_edge(GraphEdge(source_id=f"answer::{ah}", target_id=ent["node_id"], edge_type="ANSWERED_FROM"))
+    except Exception:
+        pass
 
     return {
         "question": request.question,
-        "answer": result["text"],
+        "answer": answer_text,
         "metrics": {
             "total_time_s": round(_time.time() - start, 2),
-            "llm_time_s": result["time_s"],
-            "input_tokens": result["input_tokens"],
-            "output_tokens": result["output_tokens"],
-            "total_tokens": result["total_tokens"] + total_nav_tokens,
-            "nav_tokens": total_nav_tokens,
-            "scratchpad_iterations": len([step for step in navigation_steps if "scratchpad" in step.get("step", "")]),
-            "context_entities": len(all_sources),
+            "total_tokens": total_tokens,
+            "iterations": len(steps),
         },
-        "navigation": navigation_steps,
+        "thinking": steps,
         "sources": [{"node_id": e["node_id"], "type": e["type"], "name": e["name"]} for e in all_sources[:10]],
     }
 
 
-def _parse_nav(text: str) -> Dict[str, Any]:
+def _parse_json(text: str) -> Dict[str, Any]:
     text = text.strip()
     if text.startswith("```"):
         lines = text.split("\n")
@@ -693,4 +521,4 @@ def _parse_nav(text: str) -> Dict[str, Any]:
                 return json.loads(text[start:end+1])
             except Exception:
                 pass
-    return {"selected": [], "reasoning": "parse error"}
+    return {"thinking": "parse error", "notes": "", "action": "answer:Failed to parse response"}

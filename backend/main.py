@@ -1,7 +1,6 @@
 """
-Tree Base - Universal Knowledge Graph
-Graph navigation + entity extraction for any content type.
-No embeddings, no vector search — pure graph intelligence.
+ENN - External Neural Network
+Entities = neurons. Relationships = synapses. LLM thinks freely.
 """
 
 import logging
@@ -37,8 +36,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Tree Base",
-    description="Universal Knowledge Graph — graph navigation + entity extraction for any content.",
+    title="ENN",
+    description="External Neural Network — entities are neurons, relationships are synapses, LLM thinks freely.",
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -57,7 +56,7 @@ async def root():
     index = _static_dir / "index.html"
     if index.exists():
         return FileResponse(str(index))
-    return {"name": "Tree Base", "version": "2.0.0", "docs": "/docs"}
+    return {"name": "ENN", "version": "2.0.0", "docs": "/docs"}
 
 
 @app.exception_handler(Exception)

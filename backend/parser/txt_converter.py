@@ -1,5 +1,5 @@
 """
-Tree Base - File Scanner
+ENN - File Scanner
 Finds all text files in a directory, skips binaries and junk.
 """
 

@@ -58,10 +58,11 @@ def _log_to_file(chunk_id: str, chunk_text: str, prompt: str, response: str, par
     except Exception as e:
         logger.warning(f"Failed to write extraction log: {e}")
 
-# Context-aware extraction prompt — sees existing entities
-CONTEXT_EXTRACTION_PROMPT = """You are a knowledge graph updater. Read the new content and update the knowledge graph.
+# ENN: External Neural Network — context-aware extraction
+# Entities = neurons. Edges = synapses. No categories, no abstractions.
+CONTEXT_EXTRACTION_PROMPT = """You are building an External Neural Network. Every entity is a neuron. Every edge is a synapse. Your job: extract as many neurons and synapses as possible from the content.
 
-EXISTING ENTITIES:
+EXISTING NEURONS:
 {existing_entities}
 
 CONTENT (from {source_name}):
@@ -74,9 +75,9 @@ Return ONLY valid JSON (no markdown):
 {{
   "entities": [
     {{
-      "name": "canonical name (lowercase, no brackets, reuse existing names)",
-      "type": "specific type (персонаж, локация, предмет, концепция, событие, организация, or your own)",
-      "summary": "description in content language",
+      "name": "canonical name (lowercase, reuse existing names)",
+      "type": "what it is (person, place, object, ability, event, concept...)",
+      "summary": "detailed description in content language",
       "action": "create|update"
     }}
   ],
@@ -84,7 +85,7 @@ Return ONLY valid JSON (no markdown):
     {{
       "source": "entity name",
       "target": "entity name",
-      "type": "RELATIONSHIP_TYPE",
+      "type": "RELATIONSHIP",
       "evidence_starts": "first few words of relevant text",
       "evidence_ends": "last few words of relevant text",
       "action": "create|update"
@@ -93,20 +94,18 @@ Return ONLY valid JSON (no markdown):
 }}
 
 RULES:
-- REUSE existing entity names and types
-- action="update" if entity exists and you learn something new
-- action="create" only for genuinely new entities
-- CRITICAL: connect entities TO EACH OTHER, not to abstract categories. Every entity must have at least one edge to another entity. Examples:
-  коридор → НАХОДИТСЯ_В → шахта (not коридор → BELONGS_TO → локации)
-  кён → РАБОТАЕТ_В → шахта (not кён → BELONGS_TO → персонажи)
-  шахта → ПРИНАДЛЕЖИТ → семья стоун
-- The MORE edges between entities, the BETTER. Prioritize relationships over isolated entities.
-- Evidence: first and last words of the text fragment that supports this edge
-- Summaries in the same language as content
+- REUSE existing neuron names when referring to the same thing
+- Extract EVERY person, place, object, ability, event, relationship you find
+- NEVER create abstract categories (no "персонажи", "локации", "концепции")
+- ONLY concrete entities that exist in the text
+- Connect EVERY entity to at least one other entity — isolated neurons are useless
+- The MORE synapses the BETTER — every interaction, every location link, every possession
+- Evidence: first and last words of the text fragment that proves this connection
+- Summaries: detailed, in the same language as content
 - Entity names: lowercase, no brackets"""
 
 # First chunk prompt (no existing entities yet)
-INITIAL_EXTRACTION_PROMPT = """You are a knowledge graph builder. Extract entities and relationships from this content.
+INITIAL_EXTRACTION_PROMPT = """You are building an External Neural Network. Every entity is a neuron. Every edge is a synapse. Extract as many neurons and synapses as possible.
 
 CONTENT (from {source_name}):
 {content}
@@ -118,16 +117,16 @@ Return ONLY valid JSON (no markdown):
 {{
   "entities": [
     {{
-      "name": "canonical name (lowercase, no brackets)",
-      "type": "specific type (персонаж, локация, предмет, концепция, событие, организация, or your own)",
-      "summary": "description in content language"
+      "name": "canonical name (lowercase)",
+      "type": "what it is (person, place, object, ability, event, concept...)",
+      "summary": "detailed description in content language"
     }}
   ],
   "edges": [
     {{
       "source": "entity name",
       "target": "entity name",
-      "type": "RELATIONSHIP_TYPE",
+      "type": "RELATIONSHIP",
       "evidence_starts": "first few words of relevant text",
       "evidence_ends": "last few words of relevant text"
     }}
@@ -135,14 +134,13 @@ Return ONLY valid JSON (no markdown):
 }}
 
 RULES:
-- CRITICAL: connect entities TO EACH OTHER. Every entity must have at least one edge to another entity. Examples:
-  коридор → НАХОДИТСЯ_В → шахта
-  кён → РАБОТАЕТ_В → шахта
-  шахта → ПРИНАДЛЕЖИТ → семья стоун
-- The MORE edges between entities, the BETTER. A graph without edges is useless.
-- Evidence: first and last words of the text fragment that supports this edge
+- Extract EVERY person, place, object, ability, event, relationship
+- NEVER create abstract categories — only concrete entities from text
+- Connect EVERY entity to at least one other entity
+- The MORE synapses the BETTER — every interaction, location, possession
+- Evidence: first and last words of text fragment proving the connection
 - Entity names: lowercase, no brackets
-- Summaries in the same language as content"""
+- Summaries: detailed, same language as content"""
 
 
 @dataclass

@@ -1,10 +1,10 @@
-# Tree Base - Docker Compose
+# ENN - Docker Compose
 # Neo4j + Backend only. No vector database needed.
 
 services:
   neo4j:
     image: neo4j:latest
-    container_name: treebase-neo4j
+    container_name: enn-neo4j
     ports:
       - "7474:7474"
       - "7687:7687"
@@ -25,7 +25,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: treebase-backend
+    container_name: enn-backend
     ports:
       - "8000:8000"
     environment:

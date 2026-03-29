@@ -1,4 +1,4 @@
-# Tree Base - Dependencies
+# ENN - Dependencies
 
 # Web Framework
 fastapi>=0.115.0

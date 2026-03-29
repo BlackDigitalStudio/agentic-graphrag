@@ -1,5 +1,5 @@
 """
-Tree Base - Graph Models
+ENN - Graph Models
 Data models for the universal knowledge graph.
 """
 

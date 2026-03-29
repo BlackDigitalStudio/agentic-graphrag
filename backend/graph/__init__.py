@@ -1,4 +1,4 @@
-"""Tree Base - Graph Module"""
+"""ENN - Graph Module"""
 
 from .models import GraphNode, GraphEdge, SubgraphResult, IngestResult, validate_tags
 from .storage import Neo4jStorage
