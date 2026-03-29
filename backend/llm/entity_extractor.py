@@ -190,15 +190,15 @@ class KnowledgeGraphState:
             # Only include entities mentioned in this chunk
             relevant = [ent for ent in self.entities.values()
                         if ent.name in chunk_lower]
-            # Always include high-confidence entities (categories, key characters)
+            # Always include entities with many source chunks (key characters/concepts)
             if len(relevant) < 5:
-                top = sorted(self.entities.values(), key=lambda e: -e.confidence)[:10]
+                top = sorted(self.entities.values(), key=lambda e: -len(e.source_chunks))[:10]
                 seen = {e.name for e in relevant}
                 for ent in top:
                     if ent.name not in seen:
                         relevant.append(ent)
         else:
-            relevant = sorted(self.entities.values(), key=lambda e: -e.confidence)[:max_entities]
+            relevant = sorted(self.entities.values(), key=lambda e: -len(e.source_chunks))[:max_entities]
 
         relevant = relevant[:max_entities]
 
@@ -222,7 +222,6 @@ class KnowledgeGraphState:
                 name = name[:name.index("[")].strip()
             if not name:
                 continue
-            conf = float(ent.get("confidence", 0.8))
 
             if name in self.entities:
                 # Update existing
@@ -230,8 +229,10 @@ class KnowledgeGraphState:
                 existing = self.entities[name]
                 if ent.get("summary"):
                     existing.summary = ent["summary"]
-                if conf > existing.confidence:
-                    existing.confidence = conf
+                # Update type if new type is more specific
+                if ent.get("type") and ent["type"] != existing.type:
+                    if len(ent["type"]) > len(existing.type) or existing.type in ("entity", "concept", "thing"):
+                        existing.type = ent["type"]
                 existing.source_chunks.append(chunk_id)
             else:
                 # Create new
@@ -240,7 +241,7 @@ class KnowledgeGraphState:
                     name=name,
                     type=ent.get("type", "entity"),
                     summary=ent.get("summary", ""),
-                    confidence=conf,
+                    confidence=1.0,
                     source_chunks=[chunk_id],
                 )
 
@@ -451,12 +452,10 @@ def merge_file_states(
         for name, ent in state.entities.items():
             if name in global_state.entities:
                 existing = global_state.entities[name]
-                # Keep higher confidence
-                if ent.confidence > existing.confidence:
-                    existing.confidence = ent.confidence
-                # Update type when merging if new type is more specific (longer)
-                if ent.type and len(ent.type) > len(existing.type):
-                    existing.type = ent.type
+                # Update type when merging if new type is more specific
+                if ent.type and ent.type != existing.type:
+                    if len(ent.type) > len(existing.type) or existing.type in ("entity", "concept", "thing"):
+                        existing.type = ent.type
                 # Append summary if different
                 if ent.summary and ent.summary != existing.summary:
                     existing.summary = ent.summary  # Latest wins
@@ -466,7 +465,7 @@ def merge_file_states(
                     name=ent.name,
                     type=ent.type,
                     summary=ent.summary,
-                    confidence=ent.confidence,
+                    confidence=1.0,
                     source_chunks=list(ent.source_chunks),
                 )
 
@@ -542,7 +541,7 @@ def _parse_response(text: str) -> Optional[Dict]:
                     name = name[:name.index("[")].strip()
                 etype = parts[1].strip().lower() if len(parts[1].strip()) <= 30 else "концепция"
                 summary = parts[2].strip() if len(parts) >= 3 else ""
-                entities.append({"name": name, "type": etype, "summary": summary, "action": action, "confidence": 0.8})
+                entities.append({"name": name, "type": etype, "summary": summary, "action": action})
         elif line.startswith("EDGE:"):
             rest = line[5:].strip()
             arrow = rest.find("->")

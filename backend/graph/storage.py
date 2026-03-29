@@ -201,7 +201,6 @@ class Neo4jStorage:
                         """
                         tx.run(cypher, **node.to_dict())
                         count += 1
-                    tx.commit()
         return count
     
     # ============== Edge Operations ==============
@@ -255,7 +254,6 @@ class Neo4jStorage:
                         params["metadata"] = json.dumps(params.get("metadata", {}))
                         tx.run(cypher, **params)
                         count += 1
-                    tx.commit()
         return count
     
     # ============== Navigation ==============
@@ -318,9 +316,16 @@ class Neo4jStorage:
             # Ребра из Neo4j relationship objects
             edges = []
             for rel in record["unique_edges"]:
+                try:
+                    src_id = dict(rel.start_node).get("node_id", "")
+                    tgt_id = dict(rel.end_node).get("node_id", "")
+                except Exception:
+                    continue
+                if not src_id or not tgt_id:
+                    continue
                 edge = GraphEdge(
-                    source_id=dict(rel.start_node)["node_id"],
-                    target_id=dict(rel.end_node)["node_id"],
+                    source_id=src_id,
+                    target_id=tgt_id,
                     edge_type=rel.get("type", "RELATES_TO"),
                     metadata=json.loads(rel.get("metadata", "{}")) if rel.get("metadata") else {}
                 )
@@ -371,9 +376,16 @@ class Neo4jStorage:
             nodes = [GraphNode.from_dict(dict(n)) for n in record["unique_nodes"]]
             edges = []
             for rel in record["unique_edges"]:
+                try:
+                    src_id = dict(rel.start_node).get("node_id", "")
+                    tgt_id = dict(rel.end_node).get("node_id", "")
+                except Exception:
+                    continue
+                if not src_id or not tgt_id:
+                    continue
                 edge = GraphEdge(
-                    source_id=dict(rel.start_node)["node_id"],
-                    target_id=dict(rel.end_node)["node_id"],
+                    source_id=src_id,
+                    target_id=tgt_id,
                     edge_type=rel.get("type", "RELATES_TO"),
                     metadata=json.loads(rel.get("metadata", "{}")) if rel.get("metadata") else {}
                 )
@@ -529,16 +541,27 @@ class Neo4jStorage:
     def search_entities_by_name(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         """Search entities by name — bidirectional CONTAINS for Russian declension.
         'кёна' finds 'кён' and vice versa.
+        Short terms (< 3 chars) use exact match only to avoid slow scans.
         """
-        cypher = """
-        MATCH (n:Node)
-        WHERE n.type <> 'document'
-          AND (toLower(n.name) CONTAINS toLower($search_term)
-               OR toLower($search_term) CONTAINS toLower(n.name))
-        RETURN n.node_id as node_id, n.type as type, n.name as name, n.summary as summary
-        ORDER BY n.name
-        LIMIT $lim
-        """
+        if len(query) >= 3:
+            cypher = """
+            MATCH (n:Node)
+            WHERE n.type <> 'document'
+              AND (toLower(n.name) CONTAINS toLower($search_term)
+                   OR toLower($search_term) CONTAINS toLower(n.name))
+            RETURN n.node_id as node_id, n.type as type, n.name as name, n.summary as summary
+            ORDER BY n.name
+            LIMIT $lim
+            """
+        else:
+            cypher = """
+            MATCH (n:Node)
+            WHERE n.type <> 'document'
+              AND toLower(n.name) = toLower($search_term)
+            RETURN n.node_id as node_id, n.type as type, n.name as name, n.summary as summary
+            ORDER BY n.name
+            LIMIT $lim
+            """
         with self._driver.session(database=self.database) as session:
             result = session.run(cypher, search_term=query, lim=limit)
             return [dict(r) for r in result]

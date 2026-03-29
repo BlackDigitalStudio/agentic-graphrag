@@ -173,7 +173,7 @@ def _split_into_chunks(text: str, max_size: int = 12000) -> List[str]:
             current = current + '\n\n' + para if current else para
     if current.strip():
         chunks.append(current)
-    return chunks if chunks else [text[:max_size]]
+    return chunks if chunks else [text]
 
 
 @router.post("/upload")
@@ -454,9 +454,14 @@ async def agent_query(request: AgentQueryRequest):
                         if chunk_node and chunk_node.source_code:
                             src = chunk_node.source_code
                             si = src.find(ev["evidence_starts"])
-                            ei = src.find(ev.get("evidence_ends", ""), max(0, si))
-                            if si >= 0 and ei > si:
-                                scratchpad += f"\n  [evidence] {src[si:ei + len(ev.get('evidence_ends', ''))]}"
+                            if si >= 0:
+                                ei = src.find(ev.get("evidence_ends", ""), max(0, si))
+                                if ei > si:
+                                    fragment = src[si:ei + len(ev.get('evidence_ends', ''))]
+                                else:
+                                    # No end marker — take up to 500 chars from start
+                                    fragment = src[si:si + 500]
+                                scratchpad += f"\n  [evidence] {fragment}"
 
         elif action.startswith("read_chunk:"):
             chunk_id = action[11:]
