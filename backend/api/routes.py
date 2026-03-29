@@ -66,7 +66,7 @@ class PipelineRequest(BaseModel):
 
 class AgentQueryRequest(BaseModel):
     question: str = Field(..., description="Question to ask the ENN")
-    max_iterations: int = Field(default=10, description="Max thinking iterations")
+    max_iterations: int = Field(default=10, ge=1, le=25, description="Max thinking iterations")
 
 
 # ============== Health & Stats ==============
@@ -191,8 +191,8 @@ async def upload_project(file: UploadFile = File(...)):
         with zipfile.ZipFile(tmp, 'r') as z:
             for member in z.namelist():
                 member_path = os.path.realpath(os.path.join(project_dir, member))
-                if not member_path.startswith(os.path.realpath(project_dir)):
-                    continue
+                if not member_path.startswith(os.path.realpath(project_dir) + os.sep):
+                    raise HTTPException(400, f"Zip path traversal: {member}")
             z.extractall(project_dir)
         os.remove(tmp)
     else:
@@ -468,7 +468,13 @@ async def agent_query(request: AgentQueryRequest):
             entity_name = action[16:]
             chunks = s.get_chunks_for_entity(entity_name, limit=20)
             if chunks:
-                sorted_chunks = sorted(chunks, key=lambda c: c.get("node_id", ""))
+                def _chunk_sort_key(c):
+                    nid = c.get("node_id", "")
+                    try:
+                        return int(nid.rsplit("::", 1)[-1])
+                    except ValueError:
+                        return 0
+                sorted_chunks = sorted(chunks, key=_chunk_sort_key)
                 seq = "\n".join([ch.get("content", "")[:500] for ch in sorted_chunks if ch.get("content")])
                 scratchpad += f"\n[sequential:{entity_name}] {seq[:3000]}"
 
@@ -507,10 +513,17 @@ async def agent_query(request: AgentQueryRequest):
 
 def _parse_json(text: str) -> Dict[str, Any]:
     text = text.strip()
+    # Strip <think> blocks from reasoning models
+    if "<think>" in text and "</think>" in text:
+        text = text[text.find("</think>") + 8:].strip()
+    # Strip markdown fences
     if text.startswith("```"):
         lines = text.split("\n")
-        lines = [l for l in lines if not l.startswith("```")]
-        text = "\n".join(lines)
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
     try:
         return json.loads(text)
     except Exception:

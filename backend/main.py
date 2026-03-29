@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ENN",
     description="External Neural Network — entities are neurons, relationships are synapses, LLM thinks freely.",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -56,7 +56,7 @@ async def root():
     index = _static_dir / "index.html"
     if index.exists():
         return FileResponse(str(index))
-    return {"name": "ENN", "version": "2.0.0", "docs": "/docs"}
+    return {"name": "ENN", "version": "3.0.0", "docs": "/docs"}
 
 
 @app.exception_handler(Exception)

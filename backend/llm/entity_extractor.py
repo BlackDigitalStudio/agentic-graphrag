@@ -34,7 +34,8 @@ def _log_to_file(chunk_id: str, chunk_text: str, prompt: str, response: str, par
     """Write full extraction trace to log file."""
     try:
         os.makedirs(EXTRACTION_LOG_DIR, exist_ok=True)
-        log_file = os.path.join(EXTRACTION_LOG_DIR, f"extraction_{file_name.replace('/', '_')}.log")
+        safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in file_name)
+        log_file = os.path.join(EXTRACTION_LOG_DIR, f"extraction_{safe_name}.log")
         with open(log_file, 'a', encoding='utf-8') as f:
             f.write(f"\n{'='*80}\n")
             f.write(f"CHUNK: {chunk_id} | TIME: {datetime.utcnow().isoformat()}\n")
@@ -453,6 +454,9 @@ def merge_file_states(
                 # Keep higher confidence
                 if ent.confidence > existing.confidence:
                     existing.confidence = ent.confidence
+                # Update type when merging if new type is more specific (longer)
+                if ent.type and len(ent.type) > len(existing.type):
+                    existing.type = ent.type
                 # Append summary if different
                 if ent.summary and ent.summary != existing.summary:
                     existing.summary = ent.summary  # Latest wins
@@ -477,10 +481,17 @@ def _parse_response(text: str) -> Optional[Dict]:
     """
     text = text.strip()
 
+    # Strip <think> blocks from reasoning models
+    if "<think>" in text and "</think>" in text:
+        text = text[text.find("</think>") + 8:].strip()
+
     # Remove markdown code blocks
     if text.startswith("```"):
         lines = text.split("\n")
-        lines = [l for l in lines if not l.startswith("```")]
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
         text = "\n".join(lines).strip()
 
     # Try JSON first

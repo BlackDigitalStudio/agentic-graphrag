@@ -443,7 +443,7 @@ class Neo4jStorage:
         """Get top-level entities — those with many outgoing edges (hubs of the graph)."""
         cypher = """
         MATCH (n:Node)
-        WHERE n.type <> 'document'
+        WHERE n.type NOT IN ['document', 'cached_answer']
         OPTIONAL MATCH (n)-[e:EDGE]->()
         WITH n, count(e) as out_edges
         ORDER BY out_edges DESC
@@ -455,7 +455,7 @@ class Neo4jStorage:
             return [dict(r) for r in result]
 
     def get_children(self, node_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Get child nodes connected via CONTAINS, PART_OF, BELONGS_TO, HAS_METHOD, etc."""
+        """Get child nodes connected via outgoing edges."""
         cypher = """
         MATCH (parent:Node {node_id: $node_id})-[:EDGE]->(child:Node)
         RETURN child.node_id as node_id, child.type as type, child.name as name, child.summary as summary
